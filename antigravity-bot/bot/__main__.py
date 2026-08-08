@@ -102,11 +102,13 @@ async def main() -> None:
     # Import and include routers (order matters!)
     from bot.handlers.start import router as start_router
     from bot.handlers.chats import router as chats_router
+    from bot.handlers.dashboard import router as dashboard_router
     from bot.handlers.callbacks import router as callbacks_router
     from bot.handlers.message import router as message_router
 
     dp.include_router(start_router)
     dp.include_router(chats_router)
+    dp.include_router(dashboard_router)
     dp.include_router(callbacks_router)
     dp.include_router(message_router)  # catch-all MUST be last
 

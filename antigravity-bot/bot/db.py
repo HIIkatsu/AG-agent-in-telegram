@@ -24,6 +24,18 @@ CREATE TABLE IF NOT EXISTS thread_sessions (
     created_at   TEXT    NOT NULL,
     last_used_at TEXT    NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id    INTEGER NOT NULL,
+    prompt       TEXT    NOT NULL,
+    status       TEXT    NOT NULL,
+    mode         TEXT    NOT NULL DEFAULT 'code',
+    model        TEXT,
+    started_at   TEXT,
+    finished_at  TEXT,
+    error        TEXT
+);
 """
 
 
@@ -43,6 +55,11 @@ class Database:
         self._path = settings.db_path
         self._conn: aiosqlite.Connection | None = None
 
+    @property
+    def conn(self) -> aiosqlite.Connection:
+        assert self._conn is not None, "Database not connected"
+        return self._conn
+
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
@@ -52,6 +69,12 @@ class Database:
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.executescript(_CREATE_TABLES)
+        
+        # Auto-migrate running tasks to interrupted on bot startup
+        await self._conn.execute(
+            "UPDATE tasks SET status = 'interrupted' WHERE status = 'running'"
+        )
+        
         await self._conn.commit()
 
     async def close(self) -> None:

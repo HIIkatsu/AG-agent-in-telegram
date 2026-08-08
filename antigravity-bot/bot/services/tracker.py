@@ -7,6 +7,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
 
 from aiogram import Bot
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -34,44 +35,57 @@ class StepInfo:
     status: str = "IN_PROGRESS"  # IN_PROGRESS, DONE, ERROR, DENIED
 
 
-def build_tracker_kb(thread_id: int, ws_dir: str = "", final: bool = False, commit_hash: str | None = None) -> InlineKeyboardMarkup | None:
-    """Build tracker keyboard with cancel button during generation and diff/accept/rollback buttons on completion."""
+def build_tracker_kb(thread_id: int, ws_dir: str = "", status: str = "running", commit_hash: str | None = None, task_id: int | None = None) -> InlineKeyboardMarkup | None:
+    """Build tracker keyboard based on task status."""
     has_changes = bool(ws_dir and git_manager.has_changes(ws_dir))
     
     rollback_data = f"rollback:{thread_id}"
     if commit_hash:
         rollback_data += f":{commit_hash}"
+        
+    buttons = []
 
-    if final:
+    if status == "running":
+        buttons.append([
+            InlineKeyboardButton(text="⏹ Стоп", callback_data=f"cancel_task:{task_id}" if task_id else "cancel_gen"),
+            InlineKeyboardButton(text="📌 Статус", callback_data=f"task_status:{task_id}")
+        ])
+    elif status == "done":
         if has_changes:
-            return InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(text="👀 Посмотреть Diff", callback_data=f"view_diff:{thread_id}"),
-                        InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_diff:{thread_id}"),
-                    ],
-                    [InlineKeyboardButton(text="⏪ Откатить", callback_data=rollback_data)],
-                ]
-            )
-        return None
+            buttons.append([
+                InlineKeyboardButton(text="👀 Посмотреть Diff", callback_data=f"view_diff:{thread_id}"),
+                InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_diff:{thread_id}"),
+            ])
+            buttons.append([InlineKeyboardButton(text="⏪ Откатить", callback_data=rollback_data)])
+    elif status in ("failed", "interrupted", "error"):
+        buttons.append([
+            InlineKeyboardButton(text="🔁 Повторить", callback_data=f"retry_task:{task_id}"),
+            InlineKeyboardButton(text="📄 Логи", callback_data=f"view_logs:{task_id}")
+        ])
+        if has_changes:
+            buttons.append([InlineKeyboardButton(text="⏪ Откатить", callback_data=rollback_data)])
 
-    buttons = [[InlineKeyboardButton(text="✕ Отмена", callback_data="cancel_gen")]]
-    if has_changes:
-        buttons.append([InlineKeyboardButton(text="👀 Посмотреть Diff", callback_data=f"view_diff:{thread_id}")])
-        buttons.append([InlineKeyboardButton(text="⏪ Откатить", callback_data=rollback_data)])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 
 
 class TaskTracker:
     """Manages static header, active step spinner tree, and smooth text streaming without flickering."""
 
-    def __init__(self, bot: Bot, thread_id: int, status_message: Message, ws_dir: str = "", debounce: float = 0.4, commit_hash: str | None = None):
+    def __init__(
+        self, bot: Bot, thread_id: int, status_message: Message, ws_dir: str = "", 
+        debounce: float = 0.4, commit_hash: str | None = None, task_id: int | None = None,
+        model: str = "", mode: str = "code", started_at: datetime | None = None
+    ):
         self.bot = bot
         self.thread_id = thread_id
         self.status_msg = status_message
         self.ws_dir = ws_dir
         self.debounce = debounce
         self.commit_hash = commit_hash
+        self.task_id = task_id
+        self.model = model
+        self.mode = mode
+        self.started_at = started_at or datetime.now()
 
         self.steps: list[StepInfo] = []
         self._current_step_idx: int | None = None
@@ -158,19 +172,29 @@ class TaskTracker:
         if final:
             buffer_copy = await self._extract_large_code_blocks(buffer_copy)
 
+        # Calculate elapsed time
+        elapsed_sec = int((datetime.now() - self.started_at).total_seconds())
+        m, s = divmod(elapsed_sec, 60)
+        elapsed = f"{m:02d}:{s:02d}"
+        
+        project_name = os.path.basename(self.ws_dir)
+        header = f"🧠 Задача #{self.task_id or '?'}\n"
+        header += f"Проект: <b>{project_name}</b>\n"
+        header += f"⏱ Время: {elapsed} | Модель: <i>{self.model or 'default'}</i> | Режим: <i>{self.mode}</i>\n\n"
+        
         if final:
             if self._finish_status == "DONE":
-                header = "<b>✅ Задача завершена</b>\n"
+                header += "<b>✅ Завершено</b>\n"
             elif self._finish_status == "ERROR":
-                header = "<b>❌ Ошибка выполнения</b>\n"
+                header += "<b>❌ Ошибка</b>\n"
             elif self._finish_status == "CANCELLED":
-                header = "<b>⏹ Задача отменена</b>\n"
+                header += "<b>⏹ Отменено</b>\n"
             elif self._finish_status == "TIMEOUT":
-                header = "<b>⏱ Время ожидания вышло</b>\n"
+                header += "<b>⏱ Timeout</b>\n"
             else:
-                header = f"<b>ℹ️ {self._finish_status}</b>\n"
+                header += f"<b>ℹ️ {self._finish_status}</b>\n"
         else:
-            header = "<b>Агент работает...</b>\n"
+            header += "<b>Статус:</b> running\n"
 
         step_lines = []
 
@@ -198,7 +222,8 @@ class TaskTracker:
                 step_lines[-1] = step_lines[-1].replace("├─", "└─")
 
         clean_text = clean_telegram_markdown(buffer_copy.strip())
-        kb = build_tracker_kb(self.thread_id, ws_dir=self.ws_dir, final=final, commit_hash=self.commit_hash)
+        status = self._finish_status.lower() if final else "running"
+        kb = build_tracker_kb(self.thread_id, ws_dir=self.ws_dir, status=status, commit_hash=self.commit_hash, task_id=self.task_id)
 
         if final:
             sent_msg_ids = []

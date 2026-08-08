@@ -162,28 +162,72 @@ async def cb_rollback(cq: CallbackQuery, bot: Bot) -> None:
         await cq.answer("Ошибка отката изменений.", show_alert=True)
 
 
-# ── Cancel generation ────────────────────────────────────────────────────
+# ── Task Management Callbacks ──────────────────────────────────────────────
 
-@router.callback_query(F.data == "cancel_gen")
-async def cb_cancel_gen(cq: CallbackQuery) -> None:
+@router.callback_query(F.data.startswith("cancel_task:"))
+async def cb_cancel_task(cq: CallbackQuery) -> None:
     assert cq.message
-    from bot.handlers.message import _active
+    from bot.handlers.message import _active_tasks
+    from bot.services.task_service import cancel_task
 
-    # Determine thread_id from the message context
     thread_id = cq.message.message_thread_id  # type: ignore[union-attr]
     if thread_id is None:
         await cq.answer("Нечего отменять")
         return
 
-    entry = _active.get(thread_id)
+    task_id = int(cq.data.split(":")[1])
+    
+    # Check if running
+    entry = _active_tasks.get(thread_id)
     if entry:
         tracker, agy_task = entry
-        await tracker.cancel()
-        if agy_task and not agy_task.done():
-            agy_task.cancel()
-        await cq.answer("Отменено")
-    else:
-        await cq.answer("Нечего отменять")
+        if tracker.task_id == task_id:
+            await tracker.cancel()
+            if agy_task and not agy_task.done():
+                agy_task.cancel()
+            await cq.answer("Генерация отменена!")
+            return
+            
+    # If not running, just cancel in DB
+    await cancel_task(task_id)
+    await cq.answer("Задача отменена!")
+
+
+@router.callback_query(F.data == "cancel_gen")
+async def cb_cancel_gen_legacy(cq: CallbackQuery) -> None:
+    await cq.answer("Используйте новую систему задач.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("task_status:"))
+async def cb_task_status(cq: CallbackQuery) -> None:
+    await cq.answer("Задача выполняется, пожалуйста подождите...", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("retry_task:"))
+async def cb_retry_task(cq: CallbackQuery) -> None:
+    await cq.answer("Повтор задачи пока не реализован.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("view_logs:"))
+async def cb_view_logs(cq: CallbackQuery) -> None:
+    await cq.answer("Логи пока недоступны.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("clear_queue:"))
+async def cb_clear_queue(cq: CallbackQuery) -> None:
+    from bot.services.task_service import cancel_queue
+    thread_id = int(cq.data.split(":")[1])
+    await cancel_queue(thread_id)
+    await cq.answer("Очередь очищена!")
+
+
+@router.callback_query(F.data.startswith("refresh_dashboard:"))
+async def cb_refresh_dashboard(cq: CallbackQuery, bot: Bot) -> None:
+    from bot.handlers.dashboard import cmd_project
+    # Re-trigger cmd_project
+    await cq.message.delete()
+    await cmd_project(cq.message, bot)
+    await cq.answer("Обновлено")
 
 
 # ── Web search toggle ────────────────────────────────────────────────────

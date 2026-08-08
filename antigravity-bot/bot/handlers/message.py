@@ -32,11 +32,7 @@ from bot.services.voice import transcribe_voice
 
 router = Router(name="message")
 
-# Active task tracking per thread_id: thread_id -> (tracker, agy_task)
-_active: dict[int, tuple[TaskTracker, asyncio.Task | None]] = {}
-
-# Message queue per thread_id
-_queue: dict[int, list[tuple[Message, str, list[str] | None]]] = defaultdict(list)
+_queue_loops: set[int] = set()
 
 _VOICE_FRAMES = ["🎙 ⠋ Распознаю...", "🎙 ⠙ Распознаю...", "🎙 ⠹ Распознаю...", "🎙 ⠸ Распознаю..."]
 
@@ -89,31 +85,13 @@ async def _process(
         return
 
     chat_id = message.chat.id  # group chat ID for Telegram API
-
-    # Prevent concurrent duplicate executions for the same thread
-    if thread_id in _active:
-        _, active_task = _active[thread_id]
-        if active_task and not active_task.done():
-            _queue[thread_id].append((message, text, files))
-            pos = len(_queue[thread_id])
-            try:
-                await message.reply(f"⏳ Задача поставлена в очередь (позиция {pos})", disable_notification=True)
-            except Exception:
-                pass
-            return
+    
+    # Register messages for deep rollback tracking
+    from bot.services.tracker import thread_messages_registry
+    t_reg = thread_messages_registry.setdefault(thread_id, [])
+    t_reg.append(message.message_id)
 
     session = await db.get_or_create_session(thread_id)
-
-    # Deterministic valid UUIDv5 based on thread_id so agy CLI accepts it
-    import uuid as _uuid
-    _NAMESPACE_TG = _uuid.UUID('6ba7b810-9ed0-11d1-80b4-00c04fd430c8')
-    conversation_id = str(_uuid.uuid5(_NAMESPACE_TG, f"thread-{thread_id}"))
-
-    web_search: bool = bool(session.get("web_search", 0))
-    model: str = session.get("model", "") or ""
-    ws = session["workdir"]
-    os.makedirs(ws, exist_ok=True)
-
     await db.update_last_used(thread_id)
 
     # If files were attached, add them to prompt
@@ -122,83 +100,130 @@ async def _process(
         file_list = "\n".join(f"- {f}" for f in files)
         prompt = f"{text}\n\n[Прикрепленные файлы в рабочей директории:\n{file_list}]"
 
-    # Register messages for deep rollback tracking
+    model: str = session.get("model", "") or ""
+    
+    # Enqueue task to database
+    from bot.services.task_service import enqueue_task, get_queued_count
+    await enqueue_task(thread_id, prompt, mode="code", model=model)
+    
+    # Start loop if not running
+    if thread_id not in _queue_loops:
+        _queue_loops.add(thread_id)
+        asyncio.create_task(_process_queue(thread_id, bot, chat_id))
+    else:
+        pos = await get_queued_count(thread_id)
+        try:
+            msg = await message.reply(f"⏳ Задача поставлена в очередь (позиция {pos})", disable_notification=True)
+            t_reg.append(msg.message_id)
+        except Exception:
+            pass
+
+
+# To store active tracker/agy_task per thread_id for cancellation
+_active_tasks: dict[int, tuple[TaskTracker, asyncio.Task | None]] = {}
+
+async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
+    from bot.services.task_service import pop_next_task, finish_task
     from bot.services.tracker import thread_messages_registry
-    t_reg = thread_messages_registry.setdefault(thread_id, [])
-    t_reg.append(message.message_id)
-
-    # Ensure git checkpoint is created before task execution
-    commit_hash = git_manager.create_checkpoint(ws, label=text[:25])
-
-    stop_typing = asyncio.Event()
-    typing_task = asyncio.create_task(_typing_loop(bot, chat_id, stop_typing, thread_id))
-
-    status_msg = await message.answer("<b>Агент работает...</b>\n└─ [⠋] Обработка...", parse_mode="HTML")
-    t_reg.append(status_msg.message_id)
-    tracker = TaskTracker(bot, thread_id, status_msg, ws_dir=ws, commit_hash=commit_hash)
-    await tracker.start()
-
-    # Register active execution for cancel & duplicate prevention
-    _active[thread_id] = (tracker, None)
-
-    # Take snapshot of both workspace and agy scratchpad
-    snap_before = snapshot_workspaces([ws])
-    agy_task: asyncio.Task | None = None
-
+    
     try:
-        agy_task = asyncio.create_task(run_agy(
-            prompt=prompt,
-            conversation_id=conversation_id,
-            workspace_dir=ws,
-            on_chunk=tracker.feed_text,
-            bot=bot,
-            chat_id=chat_id,
-            tracker=tracker,
-            web_search=web_search,
-            model=model,
-            thread_id=thread_id,
-        ))
-        _active[thread_id] = (tracker, agy_task)
-        full_response = await agy_task
-    except asyncio.CancelledError:
-        full_response = ""
-    finally:
-        stop_typing.set()
-        typing_task.cancel()
-        _active.pop(thread_id, None)
+        while True:
+            task = await pop_next_task(thread_id)
+            if not task:
+                break
+            
+            task_id = task["id"]
+            prompt = task["prompt"]
+            model = task["model"]
+            
+            session = await db.get_session(thread_id)
+            if not session:
+                break
+                
+            ws = session["workdir"]
+            os.makedirs(ws, exist_ok=True)
+            web_search: bool = bool(session.get("web_search", 0))
 
-    # Artifact post-tool processing across workspace + scratchpad
-    snap_after = snapshot_workspaces([ws])
-    new_files = diff_snapshots(snap_before, snap_after)
+            # Deterministic valid UUIDv5 based on thread_id
+            import uuid as _uuid
+            _NAMESPACE_TG = _uuid.UUID('6ba7b810-9ed0-11d1-80b4-00c04fd430c8')
+            conversation_id = str(_uuid.uuid5(_NAMESPACE_TG, f"thread-{thread_id}"))
 
-    # Sync any newly created files from scratchpad into workspace so Git VCS tracks them
-    import shutil
-    synced_files: list[str] = []
-    for fpath in new_files:
-        if settings.workspaces_dir not in fpath and os.path.exists(fpath):
-            dst = os.path.join(ws, os.path.basename(fpath))
+            # Ensure git checkpoint is created before task execution
+            commit_hash = git_manager.create_checkpoint(ws, label=prompt[:25])
+
+            stop_typing = asyncio.Event()
+            typing_task = asyncio.create_task(_typing_loop(bot, chat_id, stop_typing, thread_id))
+
+            status_msg = await bot.send_message(
+                chat_id, 
+                "<b>Агент работает...</b>\n└─ [⠋] Обработка...", 
+                parse_mode="HTML",
+                message_thread_id=thread_id
+            )
+            
+            t_reg = thread_messages_registry.setdefault(thread_id, [])
+            t_reg.append(status_msg.message_id)
+            
+            tracker = TaskTracker(bot, thread_id, status_msg, ws_dir=ws, commit_hash=commit_hash, task_id=task_id)
+            await tracker.start()
+
+            # Take snapshot of both workspace and agy scratchpad
+            snap_before = snapshot_workspaces([ws])
+            agy_task: asyncio.Task | None = None
+
             try:
-                shutil.copy2(fpath, dst)
-                synced_files.append(dst)
-            except Exception:
-                synced_files.append(fpath)
-        else:
-            synced_files.append(fpath)
+                agy_task = asyncio.create_task(run_agy(
+                    prompt=prompt,
+                    conversation_id=conversation_id,
+                    workspace_dir=ws,
+                    on_chunk=tracker.feed_text,
+                    bot=bot,
+                    chat_id=chat_id,
+                    tracker=tracker,
+                    web_search=web_search,
+                    model=model,
+                    thread_id=thread_id,
+                ))
+                _active_tasks[thread_id] = (tracker, agy_task)
+                full_response = await agy_task
+                await finish_task(task_id, "done")
+            except asyncio.CancelledError:
+                full_response = ""
+                await finish_task(task_id, "interrupted")
+            finally:
+                stop_typing.set()
+                typing_task.cancel()
+                _active_tasks.pop(thread_id, None)
 
-    # Finish tracker now so git_manager.has_changes(ws) checks workspace with all files present!
-    await tracker.finish()
+            # Artifact post-tool processing across workspace + scratchpad
+            snap_after = snapshot_workspaces([ws])
+            new_files = diff_snapshots(snap_before, snap_after)
 
-    if synced_files:
-        from bot.services.tracker import rollback_registry
-        rlist = rollback_registry.setdefault(status_msg.message_id, [])
-        await deliver_and_cleanup_artifacts(bot, chat_id, synced_files, thread_id=thread_id, rollback_list=rlist)
+            import shutil
+            synced_files: list[str] = []
+            for fpath in new_files:
+                if settings.workspaces_dir not in fpath and os.path.exists(fpath):
+                    dst = os.path.join(ws, os.path.basename(fpath))
+                    try:
+                        shutil.copy2(fpath, dst)
+                        synced_files.append(dst)
+                    except Exception:
+                        synced_files.append(fpath)
+                else:
+                    synced_files.append(fpath)
 
-    # Process next in queue
-    if _queue[thread_id]:
-        next_msg, next_text, next_files = _queue[thread_id].pop(0)
-        # Give a tiny breath between tasks
-        await asyncio.sleep(0.5)
-        asyncio.create_task(_process(next_msg, next_text, bot, next_files))
+            await tracker.finish()
+
+            if synced_files:
+                from bot.services.tracker import rollback_registry
+                rlist = rollback_registry.setdefault(status_msg.message_id, [])
+                await deliver_and_cleanup_artifacts(bot, chat_id, synced_files, thread_id=thread_id, rollback_list=rlist)
+
+            await asyncio.sleep(0.5)
+            
+    finally:
+        _queue_loops.discard(thread_id)
 
 
 # -- Text --
