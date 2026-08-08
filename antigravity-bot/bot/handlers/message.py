@@ -122,14 +122,20 @@ async def _process(
         file_list = "\n".join(f"- {f}" for f in files)
         prompt = f"{text}\n\n[Прикрепленные файлы в рабочей директории:\n{file_list}]"
 
+    # Register messages for deep rollback tracking
+    from bot.services.tracker import thread_messages_registry
+    t_reg = thread_messages_registry.setdefault(thread_id, [])
+    t_reg.append(message.message_id)
+
     # Ensure git checkpoint is created before task execution
-    git_manager.create_checkpoint(ws, label=text[:25])
+    commit_hash = git_manager.create_checkpoint(ws, label=text[:25])
 
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(_typing_loop(bot, chat_id, stop_typing, thread_id))
 
     status_msg = await message.answer("<b>Агент работает...</b>\n└─ [⠋] Обработка...", parse_mode="HTML")
-    tracker = TaskTracker(bot, thread_id, status_msg, ws_dir=ws)
+    t_reg.append(status_msg.message_id)
+    tracker = TaskTracker(bot, thread_id, status_msg, ws_dir=ws, commit_hash=commit_hash)
     await tracker.start()
 
     # Register active execution for cancel & duplicate prevention

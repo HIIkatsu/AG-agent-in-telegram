@@ -17,8 +17,11 @@ from bot.utils.sanitizer import clean_telegram_markdown
 
 logger = logging.getLogger(__name__)
 
-# Реестр отправленных сообщений для каждого статусного сообщения,
-# чтобы при откате (rollback) можно было их удалить.
+# Реестр всех отправленных и полученных сообщений в каждом треде (thread_id -> list[message_id])
+# Используется для безопасного удаления сообщений при ГЛУБОКОМ откате.
+thread_messages_registry: dict[int, list[int]] = {}
+
+# Реестр отправленных сообщений для каждого статусного сообщения (оставляем для совместимости)
 rollback_registry: dict[int, list[int]] = {}
 
 _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -31,9 +34,13 @@ class StepInfo:
     status: str = "IN_PROGRESS"  # IN_PROGRESS, DONE, ERROR, DENIED
 
 
-def build_tracker_kb(thread_id: int, ws_dir: str = "", final: bool = False) -> InlineKeyboardMarkup | None:
+def build_tracker_kb(thread_id: int, ws_dir: str = "", final: bool = False, commit_hash: str | None = None) -> InlineKeyboardMarkup | None:
     """Build tracker keyboard with cancel button during generation and diff/accept/rollback buttons on completion."""
     has_changes = bool(ws_dir and git_manager.has_changes(ws_dir))
+    
+    rollback_data = f"rollback:{thread_id}"
+    if commit_hash:
+        rollback_data += f":{commit_hash}"
 
     if final:
         if has_changes:
@@ -43,7 +50,7 @@ def build_tracker_kb(thread_id: int, ws_dir: str = "", final: bool = False) -> I
                         InlineKeyboardButton(text="👀 Посмотреть Diff", callback_data=f"view_diff:{thread_id}"),
                         InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_diff:{thread_id}"),
                     ],
-                    [InlineKeyboardButton(text="⏪ Откатить", callback_data=f"rollback:{thread_id}")],
+                    [InlineKeyboardButton(text="⏪ Откатить", callback_data=rollback_data)],
                 ]
             )
         return None
@@ -51,19 +58,20 @@ def build_tracker_kb(thread_id: int, ws_dir: str = "", final: bool = False) -> I
     buttons = [[InlineKeyboardButton(text="✕ Отмена", callback_data="cancel_gen")]]
     if has_changes:
         buttons.append([InlineKeyboardButton(text="👀 Посмотреть Diff", callback_data=f"view_diff:{thread_id}")])
-        buttons.append([InlineKeyboardButton(text="⏪ Откатить", callback_data=f"rollback:{thread_id}")])
+        buttons.append([InlineKeyboardButton(text="⏪ Откатить", callback_data=rollback_data)])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 class TaskTracker:
     """Manages static header, active step spinner tree, and smooth text streaming without flickering."""
 
-    def __init__(self, bot: Bot, thread_id: int, status_message: Message, ws_dir: str = "", debounce: float = 0.4):
+    def __init__(self, bot: Bot, thread_id: int, status_message: Message, ws_dir: str = "", debounce: float = 0.4, commit_hash: str | None = None):
         self.bot = bot
         self.thread_id = thread_id
         self.status_msg = status_message
         self.ws_dir = ws_dir
         self.debounce = debounce
+        self.commit_hash = commit_hash
 
         self.steps: list[StepInfo] = []
         self._current_step_idx: int | None = None
@@ -190,7 +198,7 @@ class TaskTracker:
                 step_lines[-1] = step_lines[-1].replace("├─", "└─")
 
         clean_text = clean_telegram_markdown(buffer_copy.strip())
-        kb = build_tracker_kb(self.thread_id, ws_dir=self.ws_dir, final=final)
+        kb = build_tracker_kb(self.thread_id, ws_dir=self.ws_dir, final=final, commit_hash=self.commit_hash)
 
         if final:
             sent_msg_ids = []
@@ -218,6 +226,8 @@ class TaskTracker:
                     logger.debug("Render final simple reply error: %s", e)
                 
                 rollback_registry[self.status_msg.message_id] = sent_msg_ids
+                if self.thread_id is not None:
+                    thread_messages_registry.setdefault(self.thread_id, []).extend(sent_msg_ids)
                 return
 
             # Complex task (tools used)
@@ -275,6 +285,8 @@ class TaskTracker:
                     logger.debug("Render final reply error: %s", e)
             
             rollback_registry[self.status_msg.message_id] = sent_msg_ids
+            if self.thread_id is not None:
+                thread_messages_registry.setdefault(self.thread_id, []).extend(sent_msg_ids)
             return
 
         # Not final -> we combine them to avoid spam

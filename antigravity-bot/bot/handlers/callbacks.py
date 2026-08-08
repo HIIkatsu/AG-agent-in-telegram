@@ -97,9 +97,15 @@ async def cb_rollback(cq: CallbackQuery, bot: Bot) -> None:
         return
 
     ws = session["workdir"]
+    # Parse commit_hash if available
+    parts = cq.data.split(":")
+    commit_hash = parts[2] if len(parts) > 2 else None
 
-    # 1. Execute Git Rollback (reset --hard HEAD && clean -fd)
-    ok = git_manager.rollback(ws)
+    # 1. Execute Git Rollback
+    if commit_hash:
+        ok = git_manager.rollback_to_commit(ws, commit_hash)
+    else:
+        ok = git_manager.rollback(ws)
 
     if ok:
         await cq.answer("Изменения откатаны!", show_alert=True)
@@ -114,15 +120,23 @@ async def cb_rollback(cq: CallbackQuery, bot: Bot) -> None:
         except Exception:
             pass
 
-        # 2.5 Delete telegram messages associated with this status_msg
-        from bot.services.tracker import rollback_registry
-        msg_ids = rollback_registry.pop(cq.message.message_id, [])
-        if msg_ids:
-            try:
-                await bot.delete_messages(cq.message.chat.id, msg_ids)
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning("Failed to delete rollback messages: %s", e)
+        # 2.5 Delete telegram messages associated with this deep rollback
+        from bot.services.tracker import thread_messages_registry
+        t_reg = thread_messages_registry.get(thread_id, [])
+        to_delete = [msg_id for msg_id in t_reg if msg_id > cq.message.message_id]
+        
+        if to_delete:
+            # Clean up the registry
+            thread_messages_registry[thread_id] = [msg_id for msg_id in t_reg if msg_id <= cq.message.message_id]
+            
+            # Delete in chunks of 100
+            for i in range(0, len(to_delete), 100):
+                chunk = to_delete[i:i+100]
+                try:
+                    await bot.delete_messages(cq.message.chat.id, chunk)
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).warning("Failed to delete deep rollback messages: %s", e)
 
         import uuid as _uuid
         _NAMESPACE_TG = _uuid.UUID('6ba7b810-9ed0-11d1-80b4-00c04fd430c8')

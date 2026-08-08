@@ -42,8 +42,8 @@ class GitManager:
             _run_git(ws_dir, "add", ".")
             _run_git(ws_dir, "commit", "-m", "Initial commit", "--allow-empty")
 
-    def create_checkpoint(self, ws_dir: str, label: str = "checkpoint") -> None:
-        """Create a commit snapshot before starting a new task."""
+    def create_checkpoint(self, ws_dir: str, label: str = "checkpoint") -> str:
+        """Create a commit snapshot before starting a new task and return its commit hash."""
         self.init_workspace(ws_dir)
         # Ensure .agyrules is always in .gitignore (even for pre-existing workspaces)
         gitignore_path = os.path.join(ws_dir, ".gitignore")
@@ -56,8 +56,11 @@ class GitManager:
                     for m in missing:
                         f.write(f"\n{m}")
         _run_git(ws_dir, "add", ".")
-        res = _run_git(ws_dir, "commit", "-m", f"Pre-task: {label}", "--allow-empty")
-        logger.debug("Git checkpoint created in %s: %s", ws_dir, res.stdout.strip())
+        _run_git(ws_dir, "commit", "-m", f"Pre-task: {label}", "--allow-empty")
+        res = _run_git(ws_dir, "rev-parse", "HEAD")
+        commit_hash = res.stdout.strip()
+        logger.debug("Git checkpoint created in %s: %s", ws_dir, commit_hash)
+        return commit_hash
 
     def has_changes(self, ws_dir: str) -> bool:
         """Return True if workspace has uncommitted changes or new untracked files."""
@@ -80,6 +83,14 @@ class GitManager:
         res_reset = _run_git(ws_dir, "reset", "--hard", "HEAD")
         res_clean = _run_git(ws_dir, "clean", "-fd")
         logger.info("Git rollback in %s: reset=%s, clean=%s", ws_dir, res_reset.stdout.strip(), res_clean.stdout.strip())
+        return res_reset.returncode == 0
+
+    def rollback_to_commit(self, ws_dir: str, commit_hash: str) -> bool:
+        """Revert workspace to a specific commit and clean untracked files."""
+        self.init_workspace(ws_dir)
+        res_reset = _run_git(ws_dir, "reset", "--hard", commit_hash)
+        res_clean = _run_git(ws_dir, "clean", "-fd")
+        logger.info("Git rollback to %s in %s: reset=%s, clean=%s", commit_hash, ws_dir, res_reset.stdout.strip(), res_clean.stdout.strip())
         return res_reset.returncode == 0
 
     def accept(self, ws_dir: str) -> None:
