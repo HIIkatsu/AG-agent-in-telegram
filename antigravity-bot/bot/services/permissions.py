@@ -121,10 +121,12 @@ class PermissionHandler:
             ]
         )
 
+        import html
+        escaped_details = html.escape(details)
         text = (
             "⚠️ <b>Опасное действие! Требуется подтверждение:</b>\n\n"
             f"<b>Инструмент:</b> <code>{tool_name}</code>\n"
-            f"<b>Команда:</b>\n<pre><code>{details}</code></pre>"
+            f"<b>Команда:</b>\n<pre><code>{escaped_details}</code></pre>"
         )
 
         try:

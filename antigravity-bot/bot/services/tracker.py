@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from dataclasses import dataclass
 
 from aiogram import Bot
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot.services.git_manager import git_manager
 from bot.utils.formatting import chunk_text
@@ -69,6 +70,7 @@ class TaskTracker:
         self._finished = False
         self._cancelled = False
         self._spinner_idx = 0
+        self._finish_status = "DONE"
 
         self._render_task: asyncio.Task | None = None
 
@@ -109,6 +111,7 @@ class TaskTracker:
     async def cancel(self) -> None:
         self._cancelled = True
         self._finished = True
+        self._finish_status = "CANCELLED"
         if self._render_task and not self._render_task.done():
             self._render_task.cancel()
         try:
@@ -116,8 +119,9 @@ class TaskTracker:
         except Exception:
             pass
 
-    async def finish(self) -> None:
+    async def finish(self, status: str = "DONE") -> None:
         self._finished = True
+        self._finish_status = status
         if self._render_task and not self._render_task.done():
             self._render_task.cancel()
             try:
@@ -139,7 +143,23 @@ class TaskTracker:
 
         spinner = _SPINNER[self._spinner_idx % len(_SPINNER)]
 
-        header = "<b>Агент работает...</b>\n"
+        if final:
+            buffer_copy = await self._extract_large_code_blocks(buffer_copy)
+
+        if final:
+            if self._finish_status == "DONE":
+                header = "<b>✅ Задача завершена</b>\n"
+            elif self._finish_status == "ERROR":
+                header = "<b>❌ Ошибка выполнения</b>\n"
+            elif self._finish_status == "CANCELLED":
+                header = "<b>⏹ Задача отменена</b>\n"
+            elif self._finish_status == "TIMEOUT":
+                header = "<b>⏱ Время ожидания вышло</b>\n"
+            else:
+                header = f"<b>ℹ️ {self._finish_status}</b>\n"
+        else:
+            header = "<b>Агент работает...</b>\n"
+
         step_lines = []
 
         if not steps_copy and not final:
@@ -162,17 +182,95 @@ class TaskTracker:
 
             if not final:
                 step_lines.append(f"└─ [⏳] Оформление ответа...")
-
-        full_text_blocks = []
-        if not final:
-            full_text_blocks.append(header + "\n".join(step_lines))
+            elif steps_copy:
+                step_lines[-1] = step_lines[-1].replace("├─", "└─")
 
         clean_text = clean_telegram_markdown(buffer_copy.strip())
+        kb = build_tracker_kb(self.thread_id, ws_dir=self.ws_dir, final=final)
+
+        if final:
+            if not steps_copy and clean_text:
+                # No tools used (simple answer). Transform the status message directly into the final answer.
+                chunks = chunk_text(clean_text, max_len=4000)
+                try:
+                    await self._safe_edit(self.status_msg, chunks[0], reply_markup=kb)
+                    # If there are more chunks, send them as replies
+                    if len(chunks) > 1:
+                        reply_id = self.status_msg.reply_to_message.message_id if self.status_msg.reply_to_message else None
+                        for i, chunk in enumerate(chunks[1:]):
+                            part_text = f"<i>(Часть {i+2}/{len(chunks)})</i>\n\n{chunk}"
+                            await self.bot.send_message(
+                                chat_id=self.status_msg.chat.id,
+                                text=part_text,
+                                parse_mode="HTML",
+                                disable_web_page_preview=True,
+                                message_thread_id=self.thread_id if self.thread_id else None,
+                                reply_to_message_id=reply_id
+                            )
+                except Exception as e:
+                    logger.debug("Render final simple reply error: %s", e)
+                return
+
+            # Complex task (tools used)
+            loading_text = header + "\n".join(step_lines)
+            if not clean_text:
+                loading_text += "\n└─ [ℹ️] Пустой ответ"
+            
+            await self._safe_edit(self.status_msg, loading_text, reply_markup=kb)
+            self._last_rendered_text = loading_text
+            
+            if clean_text:
+                try:
+                    chunks = chunk_text(clean_text, max_len=4000)
+                    if len(clean_text) > 12000:
+                        import tempfile
+                        import os
+                        from aiogram.types import FSInputFile
+                        
+                        reply_id = self.status_msg.reply_to_message.message_id if self.status_msg.reply_to_message else None
+                        await self.bot.send_message(
+                            chat_id=self.status_msg.chat.id,
+                            text=chunks[0] + "\n\n<i>[Ответ слишком длинный, см. файл ниже]</i>",
+                            parse_mode="HTML",
+                            message_thread_id=self.thread_id if self.thread_id else None,
+                            reply_to_message_id=reply_id
+                        )
+                        
+                        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".md", prefix="response_")
+                        try:
+                            with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
+                                f.write(buffer_copy.strip())
+                            await self.bot.send_document(
+                                self.status_msg.chat.id, 
+                                FSInputFile(tmp_path, filename="full_response.md"),
+                                message_thread_id=self.thread_id if self.thread_id else None
+                            )
+                        finally:
+                            os.remove(tmp_path)
+                    else:
+                        reply_id = self.status_msg.reply_to_message.message_id if self.status_msg.reply_to_message else None
+                        for i, chunk in enumerate(chunks):
+                            text_to_send = chunk if i == 0 else f"<i>(Часть {i+1}/{len(chunks)})</i>\n\n{chunk}"
+                            await self.bot.send_message(
+                                chat_id=self.status_msg.chat.id,
+                                text=text_to_send,
+                                parse_mode="HTML",
+                                disable_web_page_preview=True,
+                                message_thread_id=self.thread_id if self.thread_id else None,
+                                reply_to_message_id=reply_id
+                            )
+                except Exception as e:
+                    logger.debug("Render final reply error: %s", e)
+            return
+
+        # Not final -> we combine them to avoid spam
+        full_text_blocks = []
+        full_text_blocks.append(header + "\n".join(step_lines))
         if clean_text:
-            if not final and steps_copy:
+            if steps_copy:
                 full_text_blocks.append("────────────────────")
             full_text_blocks.append(clean_text)
-
+            
         rendered = "\n".join(full_text_blocks).strip()
         if not rendered:
             return
@@ -180,7 +278,6 @@ class TaskTracker:
         if rendered == self._last_rendered_text and not force:
             return
 
-        kb = build_tracker_kb(self.thread_id, ws_dir=self.ws_dir, final=final)
         try:
             chunks = chunk_text(rendered, max_len=4000)
             await self._safe_edit(self.status_msg, chunks[0], reply_markup=kb)
@@ -207,3 +304,59 @@ class TaskTracker:
                     await msg.edit_text(re.sub(r"<[^>]+>", "", html_text), reply_markup=reply_markup)
                 except Exception:
                     pass
+
+    async def _extract_large_code_blocks(self, text: str) -> str:
+        """Extract code blocks > 1500 chars or > 50 lines to files and send to Telegram."""
+        pattern = re.compile(r"```([a-zA-Z0-9_\-\+]*)\n(.*?)```", re.DOTALL)
+        matches = list(pattern.finditer(text))
+        
+        if not matches:
+            return text
+            
+        ext_map = {
+            "python": ".py", "py": ".py", "javascript": ".js", "js": ".js",
+            "typescript": ".ts", "ts": ".ts", "html": ".html", "css": ".css",
+            "bash": ".sh", "sh": ".sh", "json": ".json", "yaml": ".yaml",
+            "yml": ".yml", "sql": ".sql", "xml": ".xml", "markdown": ".md",
+            "md": ".md", "cpp": ".cpp", "c": ".c", "java": ".java", "go": ".go",
+            "rust": ".rs", "rs": ".rs", "php": ".php", "ruby": ".rb", "rb": ".rb"
+        }
+        
+        offset = 0
+        result = []
+        snippets_count = 0
+        
+        for m in matches:
+            lang = m.group(1).strip().lower()
+            code = m.group(2)
+            lines_count = len(code.split("\n"))
+            
+            if len(code) > 1500 or lines_count > 50:
+                snippets_count += 1
+                ext = ext_map.get(lang, ".txt") if lang else ".txt"
+                filename = f"snippet_{snippets_count}{ext}"
+                file_path = os.path.join(self.ws_dir, filename)
+                
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(code)
+                
+                try:
+                    await self.bot.send_document(
+                        self.status_msg.chat.id,
+                        FSInputFile(file_path, filename=filename),
+                        message_thread_id=self.thread_id if self.thread_id else None
+                    )
+                except Exception as e:
+                    logger.error("Failed to send snippet %s: %s", filename, e)
+                
+                placeholder = f"📄 [Сгенерирован файл: {filename} | {lines_count} строк]"
+                
+                result.append(text[offset:m.start()])
+                result.append(placeholder)
+                offset = m.end()
+            else:
+                result.append(text[offset:m.end()])
+                offset = m.end()
+                
+        result.append(text[offset:])
+        return "".join(result)

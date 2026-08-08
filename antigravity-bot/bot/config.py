@@ -11,8 +11,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file="/opt/antigravity-bot/.env",
+        env_file=(".env", "./antigravity-bot/.env", "/opt/antigravity-bot/.env"),
         env_file_encoding="utf-8",
+        extra="ignore"
     )
 
     bot_token: str
@@ -24,6 +25,10 @@ class Settings(BaseSettings):
     db_path: str = "/opt/antigravity-bot/data/bot.db"
     log_level: str = "INFO"
     config_json_path: str = "/opt/antigravity-bot/config.json"
+    
+    # Timeouts
+    task_timeout_seconds: int = 600
+    agy_print_timeout: str = "10m0s"
 
     @property
     def allowed_ids(self) -> list[int]:

@@ -98,7 +98,7 @@ async def run_agy(
         "--add-dir", workspace_dir,
         "--dangerously-skip-permissions",
         "--output-format", "stream-json",
-        "--print-timeout", "10m0s",
+        "--print-timeout", settings.agy_print_timeout,
     ]
 
     # Model passed as exact CLI string name, e.g. "Claude Sonnet 4.6 (Thinking)"
@@ -138,7 +138,7 @@ async def run_agy(
     stderr_task = asyncio.create_task(_read_stderr())
 
     try:
-        async with asyncio.timeout(300):
+        async with asyncio.timeout(settings.task_timeout_seconds):
             assert proc.stdout is not None
             while True:
                 chunk = await proc.stdout.read(1024)
@@ -260,12 +260,13 @@ async def run_agy(
                     await on_chunk(err_msg)
 
     except TimeoutError:
-        logger.error("agy execution timed out (300s limit)")
+        logger.error("agy execution timed out (%ds limit)", settings.task_timeout_seconds)
         try:
             proc.kill()
         except Exception:
             pass
-        timeout_msg = "\n\n❌ <b>Ошибка выполнения:</b>\n<pre><code>Превышен таймаут выполнения задачи (5 минут). Процесс принудительно остановлен.</code></pre>"
+        minutes = settings.task_timeout_seconds // 60
+        timeout_msg = f"\n\n❌ <b>Ошибка выполнения:</b>\n<pre><code>Превышен таймаут выполнения задачи ({minutes} минут). Процесс принудительно остановлен.</code></pre>"
         full_response += timeout_msg
         await on_chunk(timeout_msg)
     except asyncio.CancelledError:

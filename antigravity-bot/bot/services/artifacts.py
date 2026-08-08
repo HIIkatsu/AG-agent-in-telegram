@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+from pathlib import Path
 
 from aiogram import Bot
 from aiogram.types import FSInputFile
@@ -25,31 +27,45 @@ _TRACK_EXT = (
     }
 )
 
+_DELIVER_EXT = {
+    ".pdf", ".zip", ".tar", ".gz", ".rar", ".7z", 
+    ".pptx", ".docx", ".xlsx", ".csv", ".txt"
+}
+
 _DEFAULT_SCRATCH_DIRS = [
     "/root/.gemini/antigravity-cli/scratch",
     "/root/.gemini/antigravity-ide/scratch",
 ]
 
+def _is_valid_dir(d: Path) -> bool:
+    name = d.name
+    if name.startswith("."):
+        return False
+    if name in {"node_modules", "__pycache__", "venv", ".venv"}:
+        return False
+    return True
 
 def snapshot_workspaces(target_dirs: list[str]) -> dict[str, float]:
     """Return ``{absolute_path: mtime}`` for trackable files across workspace and scratchpad directories."""
     snap: dict[str, float] = {}
-    all_dirs = list(target_dirs) + _DEFAULT_SCRATCH_DIRS
+    all_dirs = [Path(d).resolve() for d in target_dirs + _DEFAULT_SCRATCH_DIRS]
 
     for d in all_dirs:
-        if not os.path.isdir(d):
+        if not d.is_dir():
             try:
-                os.makedirs(d, exist_ok=True)
+                d.mkdir(parents=True, exist_ok=True)
             except Exception:
                 continue
+                
         for root, dirs, files in os.walk(d):
-            dirs[:] = [sub for sub in dirs if not sub.startswith(".")]
+            root_path = Path(root)
+            dirs[:] = [sub for sub in dirs if _is_valid_dir(Path(sub))]
             for fname in files:
-                ext = os.path.splitext(fname)[1].lower()
+                ext = Path(fname).suffix.lower()
                 if ext in _TRACK_EXT:
-                    fpath = os.path.join(root, fname)
+                    fpath = root_path / fname
                     try:
-                        snap[fpath] = os.path.getmtime(fpath)
+                        snap[str(fpath)] = fpath.stat().st_mtime
                     except OSError:
                         pass
     return snap
@@ -64,12 +80,12 @@ def diff_snapshots(
         if p not in before or before[p] < mt
     ]
 
-    # Deduplicate by basename (prefer workspace dir over temp scratchpad)
     seen_names: set[str] = set()
     deduped: list[str] = []
 
     # Sort workspace paths first
-    changed_paths.sort(key=lambda p: (0 if settings.workspaces_dir in p else 1, p))
+    ws_dir = str(Path(settings.workspaces_dir).resolve())
+    changed_paths.sort(key=lambda p: (0 if p.startswith(ws_dir) else 1, p))
 
     for p in changed_paths:
         name = os.path.basename(p)
@@ -80,32 +96,56 @@ def diff_snapshots(
     return deduped
 
 
+def should_deliver(fpath: Path) -> bool:
+    """Check if the file should be delivered to Telegram."""
+    ext = fpath.suffix.lower()
+    
+    # Always deliver explicitly requested file types
+    if ext in _DELIVER_EXT:
+        return True
+        
+    # Always deliver images, but filter out background images later
+    if ext in _IMAGE_EXT:
+        return True
+        
+    # Deliver HTML, CSV, etc ONLY if they are in 'artifacts' or 'output' folders
+    parts = fpath.parts
+    if "artifacts" in parts or "output" in parts or "outputs" in parts:
+        return True
+        
+    return False
+
+
 async def deliver_and_cleanup_artifacts(bot: Bot, chat_id: int, files: list[str], thread_id: int | None = None) -> None:
     """Send detected artifacts as documents to Telegram without deleting workspace project files."""
-    for fpath in files:
-        if not os.path.exists(fpath):
+    ws_dir = str(Path(settings.workspaces_dir).resolve())
+    
+    for fpath_str in files:
+        fpath = Path(fpath_str)
+        if not fpath.exists():
             continue
 
-        name = os.path.basename(fpath)
-        ext = os.path.splitext(fpath)[1].lower()
-        inp = FSInputFile(fpath)
-
-        # Skip sending standalone background images (e.g. bg.jpg, hero_bg.jpg) as photos to avoid photo spam
-        if ext in _IMAGE_EXT and ("bg" in name.lower() or "background" in name.lower() or "hero" in name.lower()):
-            logger.info("Skipping standalone background image telegram photo spam: %s", name)
-            continue
-
-        try:
-            # Deliver all artifacts (including HTML, CSS, JS, Images) as clean document files
-            await bot.send_document(chat_id, inp, caption=name, message_thread_id=thread_id)
-            logger.info("Delivered artifact to Telegram: %s", fpath)
-        except Exception:
-            logger.exception("Failed to deliver artifact %s to Telegram", fpath)
-        finally:
-            # ONLY clean up temporary scratchpad files. NEVER delete user's workspace files!
-            if settings.workspaces_dir not in fpath and os.path.exists(fpath):
+        name = fpath.name
+        ext = fpath.suffix.lower()
+        
+        # Decide whether to send to Telegram
+        if should_deliver(fpath):
+            # Skip sending standalone background images to avoid photo spam
+            if ext in _IMAGE_EXT and any(kw in name.lower() for kw in ("bg", "background", "hero")):
+                logger.info("Skipping standalone background image telegram photo spam: %s", name)
+            else:
                 try:
-                    os.remove(fpath)
-                    logger.info("Cleaned up scratchpad file from disk: %s", fpath)
-                except Exception as e:
-                    logger.warning("Failed to remove scratch file %s: %s", fpath, e)
+                    inp = FSInputFile(str(fpath))
+                    await bot.send_document(chat_id, inp, caption=name, message_thread_id=thread_id)
+                    logger.info("Delivered artifact to Telegram: %s", fpath)
+                except Exception:
+                    logger.exception("Failed to deliver artifact %s to Telegram", fpath)
+
+        # ONLY clean up temporary scratchpad files. NEVER delete user's workspace files!
+        if not str(fpath).startswith(ws_dir):
+            try:
+                fpath.unlink(missing_ok=True)
+                logger.info("Cleaned up scratchpad file from disk: %s", fpath)
+            except Exception as e:
+                logger.warning("Failed to remove scratch file %s: %s", fpath, e)
+

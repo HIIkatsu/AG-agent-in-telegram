@@ -10,7 +10,9 @@ import asyncio
 import os
 import re
 import tempfile
+import urllib.parse
 from typing import Any
+from collections import defaultdict
 
 from aiogram import Bot, F, Router
 from aiogram.types import Message
@@ -33,7 +35,16 @@ router = Router(name="message")
 # Active task tracking per thread_id: thread_id -> (tracker, agy_task)
 _active: dict[int, tuple[TaskTracker, asyncio.Task | None]] = {}
 
+# Message queue per thread_id
+_queue: dict[int, list[tuple[Message, str, list[str] | None]]] = defaultdict(list)
+
 _VOICE_FRAMES = ["🎙 ⠋ Распознаю...", "🎙 ⠙ Распознаю...", "🎙 ⠹ Распознаю...", "🎙 ⠸ Распознаю..."]
+
+def _normalize_filename(name: str) -> str:
+    """Normalize uploaded filename to be safe."""
+    name = urllib.parse.unquote(name)
+    name = re.sub(r'[^\w\.-]', '_', name)
+    return name.strip('_') or "uploaded_file"
 
 
 async def _typing_loop(bot: Bot, chat_id: int, stop_event: asyncio.Event, thread_id: int | None = None) -> None:
@@ -83,6 +94,12 @@ async def _process(
     if thread_id in _active:
         _, active_task = _active[thread_id]
         if active_task and not active_task.done():
+            _queue[thread_id].append((message, text, files))
+            pos = len(_queue[thread_id])
+            try:
+                await message.reply(f"⏳ Задача поставлена в очередь (позиция {pos})", disable_notification=True)
+            except Exception:
+                pass
             return
 
     session = await db.get_or_create_session(thread_id)
@@ -168,6 +185,13 @@ async def _process(
     if synced_files:
         await deliver_and_cleanup_artifacts(bot, chat_id, synced_files, thread_id=thread_id)
 
+    # Process next in queue
+    if _queue[thread_id]:
+        next_msg, next_text, next_files = _queue[thread_id].pop(0)
+        # Give a tiny breath between tasks
+        await asyncio.sleep(0.5)
+        asyncio.create_task(_process(next_msg, next_text, bot, next_files))
+
 
 # -- Text --
 @router.message(F.text & ~F.text.startswith("/"))
@@ -186,17 +210,20 @@ async def on_photo(message: Message, bot: Bot) -> None:
 
     session = await db.get_or_create_session(thread_id)
     ws = session["workdir"]
-    os.makedirs(ws, exist_ok=True)
+    uploads_dir = os.path.join(ws, "uploads")
+    os.makedirs(uploads_dir, exist_ok=True)
 
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
     assert file.file_path
     ext = os.path.splitext(file.file_path)[1] or ".jpg"
-    local_path = os.path.join(ws, f"photo_{photo.file_unique_id}{ext}")
+    filename = _normalize_filename(f"photo_{photo.file_unique_id}{ext}")
+    local_path = os.path.join(uploads_dir, filename)
     await bot.download_file(file.file_path, local_path)
 
     caption = message.caption or "Пользователь отправил фото. Проанализируй его."
-    prompt = f"{caption}\n\n[Фото сохранено: {local_path}]"
+    rel_path = f"uploads/{filename}"
+    prompt = f"{caption}\n\n[Фото сохранено: {rel_path}]"
     await _process(message, prompt, bot, files=[local_path])
 
 
@@ -210,17 +237,29 @@ async def on_document(message: Message, bot: Bot) -> None:
 
     session = await db.get_or_create_session(thread_id)
     ws = session["workdir"]
-    os.makedirs(ws, exist_ok=True)
+    uploads_dir = os.path.join(ws, "uploads")
+    os.makedirs(uploads_dir, exist_ok=True)
 
     doc = message.document
     file = await bot.get_file(doc.file_id)
     assert file.file_path
     filename = doc.file_name or f"file_{doc.file_unique_id}"
-    local_path = os.path.join(ws, filename)
+    filename = _normalize_filename(filename)
+    
+    # Handle duplicates
+    base, ext = os.path.splitext(filename)
+    counter = 1
+    local_path = os.path.join(uploads_dir, filename)
+    while os.path.exists(local_path):
+        filename = f"{base}_{counter}{ext}"
+        local_path = os.path.join(uploads_dir, filename)
+        counter += 1
+        
     await bot.download_file(file.file_path, local_path)
 
     caption = message.caption or f"Пользователь отправил файл: {filename}"
-    prompt = f"{caption}\n\n[Файл сохранен: {local_path}]"
+    rel_path = f"uploads/{filename}"
+    prompt = f"{caption}\n\n[Файл сохранен: {rel_path}]"
     await _process(message, prompt, bot, files=[local_path])
 
 
