@@ -17,6 +17,10 @@ from bot.utils.sanitizer import clean_telegram_markdown
 
 logger = logging.getLogger(__name__)
 
+# Реестр отправленных сообщений для каждого статусного сообщения,
+# чтобы при откате (rollback) можно было их удалить.
+rollback_registry: dict[int, list[int]] = {}
+
 _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 
@@ -189,6 +193,8 @@ class TaskTracker:
         kb = build_tracker_kb(self.thread_id, ws_dir=self.ws_dir, final=final)
 
         if final:
+            sent_msg_ids = []
+            
             if not steps_copy and clean_text:
                 # No tools used (simple answer). Transform the status message directly into the final answer.
                 chunks = chunk_text(clean_text, max_len=4000)
@@ -199,7 +205,7 @@ class TaskTracker:
                         reply_id = self.status_msg.reply_to_message.message_id if self.status_msg.reply_to_message else None
                         for i, chunk in enumerate(chunks[1:]):
                             part_text = f"<i>(Часть {i+2}/{len(chunks)})</i>\n\n{chunk}"
-                            await self.bot.send_message(
+                            msg = await self.bot.send_message(
                                 chat_id=self.status_msg.chat.id,
                                 text=part_text,
                                 parse_mode="HTML",
@@ -207,8 +213,11 @@ class TaskTracker:
                                 message_thread_id=self.thread_id if self.thread_id else None,
                                 reply_to_message_id=reply_id
                             )
+                            sent_msg_ids.append(msg.message_id)
                 except Exception as e:
                     logger.debug("Render final simple reply error: %s", e)
+                
+                rollback_registry[self.status_msg.message_id] = sent_msg_ids
                 return
 
             # Complex task (tools used)
@@ -228,30 +237,32 @@ class TaskTracker:
                         from aiogram.types import FSInputFile
                         
                         reply_id = self.status_msg.reply_to_message.message_id if self.status_msg.reply_to_message else None
-                        await self.bot.send_message(
+                        msg1 = await self.bot.send_message(
                             chat_id=self.status_msg.chat.id,
                             text=chunks[0] + "\n\n<i>[Ответ слишком длинный, см. файл ниже]</i>",
                             parse_mode="HTML",
                             message_thread_id=self.thread_id if self.thread_id else None,
                             reply_to_message_id=reply_id
                         )
+                        sent_msg_ids.append(msg1.message_id)
                         
                         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".md", prefix="response_")
                         try:
                             with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
                                 f.write(buffer_copy.strip())
-                            await self.bot.send_document(
+                            msg2 = await self.bot.send_document(
                                 self.status_msg.chat.id, 
                                 FSInputFile(tmp_path, filename="full_response.md"),
                                 message_thread_id=self.thread_id if self.thread_id else None
                             )
+                            sent_msg_ids.append(msg2.message_id)
                         finally:
                             os.remove(tmp_path)
                     else:
                         reply_id = self.status_msg.reply_to_message.message_id if self.status_msg.reply_to_message else None
                         for i, chunk in enumerate(chunks):
                             text_to_send = chunk if i == 0 else f"<i>(Часть {i+1}/{len(chunks)})</i>\n\n{chunk}"
-                            await self.bot.send_message(
+                            msg = await self.bot.send_message(
                                 chat_id=self.status_msg.chat.id,
                                 text=text_to_send,
                                 parse_mode="HTML",
@@ -259,8 +270,11 @@ class TaskTracker:
                                 message_thread_id=self.thread_id if self.thread_id else None,
                                 reply_to_message_id=reply_id
                             )
+                            sent_msg_ids.append(msg.message_id)
                 except Exception as e:
                     logger.debug("Render final reply error: %s", e)
+            
+            rollback_registry[self.status_msg.message_id] = sent_msg_ids
             return
 
         # Not final -> we combine them to avoid spam

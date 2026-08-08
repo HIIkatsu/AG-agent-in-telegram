@@ -118,7 +118,13 @@ def should_deliver(fpath: Path) -> bool:
     return False
 
 
-async def deliver_and_cleanup_artifacts(bot: Bot, chat_id: int, files: list[str], thread_id: int | None = None) -> None:
+async def deliver_and_cleanup_artifacts(
+    bot: Bot, 
+    chat_id: int, 
+    files: list[str], 
+    thread_id: int | None = None,
+    rollback_list: list[int] | None = None,
+) -> None:
     """Send detected artifacts as documents to Telegram without deleting workspace project files."""
     ws_dir = str(Path(settings.workspaces_dir).resolve())
     
@@ -138,7 +144,9 @@ async def deliver_and_cleanup_artifacts(bot: Bot, chat_id: int, files: list[str]
             else:
                 try:
                     inp = FSInputFile(str(fpath))
-                    await bot.send_document(chat_id, inp, caption=name, message_thread_id=thread_id)
+                    msg = await bot.send_document(chat_id, inp, caption=name, message_thread_id=thread_id)
+                    if rollback_list is not None:
+                        rollback_list.append(msg.message_id)
                     logger.info("Delivered artifact to Telegram: %s", fpath)
                 except Exception:
                     logger.exception("Failed to deliver artifact %s to Telegram", fpath)

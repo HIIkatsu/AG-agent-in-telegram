@@ -114,6 +114,16 @@ async def cb_rollback(cq: CallbackQuery, bot: Bot) -> None:
         except Exception:
             pass
 
+        # 2.5 Delete telegram messages associated with this status_msg
+        from bot.services.tracker import rollback_registry
+        msg_ids = rollback_registry.pop(cq.message.message_id, [])
+        if msg_ids:
+            try:
+                await bot.delete_messages(cq.message.chat.id, msg_ids)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning("Failed to delete rollback messages: %s", e)
+
         import uuid as _uuid
         _NAMESPACE_TG = _uuid.UUID('6ba7b810-9ed0-11d1-80b4-00c04fd430c8')
         conv_id = str(_uuid.uuid5(_NAMESPACE_TG, f"thread-{thread_id}"))

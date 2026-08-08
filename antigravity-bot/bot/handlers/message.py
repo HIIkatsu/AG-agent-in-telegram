@@ -183,7 +183,9 @@ async def _process(
     await tracker.finish()
 
     if synced_files:
-        await deliver_and_cleanup_artifacts(bot, chat_id, synced_files, thread_id=thread_id)
+        from bot.services.tracker import rollback_registry
+        rlist = rollback_registry.setdefault(status_msg.message_id, [])
+        await deliver_and_cleanup_artifacts(bot, chat_id, synced_files, thread_id=thread_id, rollback_list=rlist)
 
     # Process next in queue
     if _queue[thread_id]:
