@@ -1,0 +1,29 @@
+# Environment & Secrets
+.env
+*.env
+*.pem
+*.key
+*.db
+*.sqlite3
+
+# Python & Runtime
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# Temporary / Diagnostic scripts
+_check_server.py
+test_*.py
+test.html
+test.js
+test2.js
+remote_exec.py
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

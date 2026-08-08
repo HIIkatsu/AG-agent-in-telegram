@@ -1,0 +1,28 @@
+{
+  "models": [
+    {
+      "id": "Gemini 3.6 Flash (High)",
+      "name": "Gemini 3.6 Flash (High)"
+    },
+    {
+      "id": "Gemini 3.5 Flash (High)",
+      "name": "Gemini 3.5 Flash (High)"
+    },
+    {
+      "id": "Gemini 3.1 Pro (High)",
+      "name": "Gemini 3.1 Pro (High)"
+    },
+    {
+      "id": "Claude Sonnet 4.6 (Thinking)",
+      "name": "Claude Sonnet 4.6 (Thinking)"
+    },
+    {
+      "id": "Claude Opus 4.6 (Thinking)",
+      "name": "Claude Opus 4.6 (Thinking)"
+    },
+    {
+      "id": "GPT-OSS 120B (Medium)",
+      "name": "GPT-OSS 120B (Medium)"
+    }
+  ]
+}
