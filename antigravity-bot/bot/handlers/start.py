@@ -64,23 +64,4 @@ async def cmd_help(message: Message) -> None:
         )
 
 
-@router.message(Command("stats"))
-async def cmd_stats(message: Message) -> None:
-    sessions = await db.list_all_sessions()
-    if not sessions:
-        await message.answer("📊 Нет активных сессий. Создайте ветку и начните диалог.")
-        return
 
-    lines = [f"📊 <b>Статистика — {len(sessions)} сессий</b>\n"]
-    for s in sessions[:20]:
-        mounted = "📌" if s.get("is_mounted") else "📁"
-        model = s.get("model") or "default"
-        web = " 🌐" if s.get("web_search") else ""
-        workdir_short = s["workdir"][-30:]
-        lines.append(
-            f"{mounted} Thread <code>{s['thread_id']}</code> | "
-            f"{model}{web} | "
-            f"<code>…{workdir_short}</code>"
-        )
-
-    await message.answer("\n".join(lines), parse_mode="HTML")

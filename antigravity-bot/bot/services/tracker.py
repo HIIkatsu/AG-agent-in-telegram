@@ -47,23 +47,23 @@ def build_tracker_kb(thread_id: int, ws_dir: str = "", status: str = "running", 
 
     if status == "running":
         buttons.append([
-            InlineKeyboardButton(text="⏹ Стоп", callback_data=f"cancel_task:{task_id}" if task_id else "cancel_gen"),
-            InlineKeyboardButton(text="📌 Статус", callback_data=f"task_status:{task_id}")
+            InlineKeyboardButton(text="⏹ Стоп", callback_data=f"t:st:{task_id}" if task_id else "cancel_gen"),
+            InlineKeyboardButton(text="📌 Статус", callback_data=f"t:ss:{task_id}" if task_id else "task_status:0")
         ])
     elif status == "done":
         if has_changes:
             buttons.append([
-                InlineKeyboardButton(text="👀 Посмотреть Diff", callback_data=f"view_diff:{thread_id}"),
-                InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_diff:{thread_id}"),
+                InlineKeyboardButton(text="👀 Diff", callback_data=f"t:df:{task_id or thread_id}"),
+                InlineKeyboardButton(text="✅ Accept", callback_data=f"t:ac:{task_id or thread_id}"),
             ])
-            buttons.append([InlineKeyboardButton(text="⏪ Откатить", callback_data=rollback_data)])
+            buttons.append([InlineKeyboardButton(text="⏪ Rollback", callback_data=rollback_data)])
     elif status in ("failed", "interrupted", "error"):
         buttons.append([
-            InlineKeyboardButton(text="🔁 Повторить", callback_data=f"retry_task:{task_id}"),
-            InlineKeyboardButton(text="📄 Логи", callback_data=f"view_logs:{task_id}")
+            InlineKeyboardButton(text="🔁 Retry", callback_data=f"t:rt:{task_id}" if task_id else "retry_task:0"),
+            InlineKeyboardButton(text="📄 Logs", callback_data=f"t:lg:{task_id}" if task_id else "view_logs:0")
         ])
         if has_changes:
-            buttons.append([InlineKeyboardButton(text="⏪ Откатить", callback_data=rollback_data)])
+            buttons.append([InlineKeyboardButton(text="⏪ Rollback", callback_data=rollback_data)])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 
@@ -268,9 +268,6 @@ class TaskTracker:
                     chunks = chunk_text(clean_text, max_len=4000)
                     if len(clean_text) > 12000:
                         import tempfile
-                        import os
-                        from aiogram.types import FSInputFile
-                        
                         reply_id = self.status_msg.reply_to_message.message_id if self.status_msg.reply_to_message else None
                         msg1 = await self.bot.send_message(
                             chat_id=self.status_msg.chat.id,

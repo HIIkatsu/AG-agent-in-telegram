@@ -10,13 +10,13 @@ logger = logging.getLogger(__name__)
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-async def enqueue_task(thread_id: int, prompt: str, mode: str = "code", model: str | None = None) -> int:
+async def enqueue_task(thread_id: int, chat_id: int, project_id: int, prompt: str, mode: str = "code", model: str | None = None, parent_task_id: int | None = None, retry_of_task_id: int | None = None) -> int:
     """Add a new task to the queue and return its ID."""
     now = _now()
     cur = await db.conn.execute(
-        "INSERT INTO tasks (thread_id, prompt, status, mode, model, started_at, finished_at, error) "
-        "VALUES (?, ?, 'queued', ?, ?, NULL, NULL, NULL)",
-        (thread_id, prompt, mode, model)
+        "INSERT INTO tasks (chat_id, thread_id, project_id, prompt, status, mode, model, created_at, started_at, finished_at, error, parent_task_id, retry_of_task_id) "
+        "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, NULL, NULL, NULL, ?, ?)",
+        (chat_id, thread_id, project_id, prompt, mode, model, now, parent_task_id, retry_of_task_id)
     )
     await db.conn.commit()
     return cur.lastrowid
@@ -70,6 +70,12 @@ async def get_active_task(thread_id: int) -> dict | None:
     row = await cur.fetchone()
     return dict(row) if row else None
 
+async def get_task(task_id: int) -> dict | None:
+    """Get task by ID."""
+    cur = await db.conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
 async def get_queued_count(thread_id: int) -> int:
     """Get number of queued tasks for a thread."""
     cur = await db.conn.execute(
@@ -79,10 +85,26 @@ async def get_queued_count(thread_id: int) -> int:
     row = await cur.fetchone()
     return row["c"] if row else 0
 
-async def finish_task(task_id: int, status: str, error: str | None = None) -> None:
+async def finish_task(task_id: int, status: str, error: str | None = None, result_summary: str | None = None) -> None:
     """Mark a task as done or failed."""
     await db.conn.execute(
-        "UPDATE tasks SET status = ?, finished_at = ?, error = ? WHERE id = ?",
-        (status, _now(), error, task_id)
+        "UPDATE tasks SET status = ?, finished_at = ?, error = ?, result_summary = ? WHERE id = ?",
+        (status, _now(), error, result_summary, task_id)
+    )
+    await db.conn.commit()
+
+async def recovery_interrupted_tasks() -> None:
+    """Mark all running tasks as interrupted (e.g. after bot restart)."""
+    assert db.conn
+    await db.conn.execute(
+        "UPDATE tasks SET status = 'interrupted', result_summary = 'Bot restarted' WHERE status = 'running'"
+    )
+    await db.conn.commit()
+
+async def log_task_event(task_id: int, level: str, message: str, data: str | None = None) -> None:
+    """Add a log entry for a task."""
+    await db.conn.execute(
+        "INSERT INTO task_logs (task_id, timestamp, level, message, data) VALUES (?, ?, ?, ?, ?)",
+        (task_id, _now(), level, message, data)
     )
     await db.conn.commit()

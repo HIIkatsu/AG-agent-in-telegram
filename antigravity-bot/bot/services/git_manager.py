@@ -42,6 +42,12 @@ class GitManager:
             _run_git(ws_dir, "add", ".")
             _run_git(ws_dir, "commit", "-m", "Initial commit", "--allow-empty")
 
+    def get_current_branch(self, ws_dir: str) -> str:
+        """Return the current branch name."""
+        self.init_workspace(ws_dir)
+        res = _run_git(ws_dir, "rev-parse", "--abbrev-ref", "HEAD")
+        return res.stdout.strip()
+
     def create_checkpoint(self, ws_dir: str, label: str = "checkpoint") -> str:
         """Create a commit snapshot before starting a new task and return its commit hash."""
         self.init_workspace(ws_dir)

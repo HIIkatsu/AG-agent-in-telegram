@@ -17,7 +17,10 @@ files = [
     # Config + env
     (r".env", "/opt/antigravity-bot/.env"),
     (r"config.json", "/opt/antigravity-bot/config.json"),
+    (r"migrate.py", "/opt/antigravity-bot/migrate.py"),
+    (r"migrate_phase2.py", "/opt/antigravity-bot/migrate_phase2.py"),
     # Core
+    (r"bot\modes.py", "/opt/antigravity-bot/bot/modes.py"),
     (r"bot\config.py", "/opt/antigravity-bot/bot/config.py"),
     (r"bot\db.py", "/opt/antigravity-bot/bot/db.py"),
     (r"bot\middleware.py", "/opt/antigravity-bot/bot/middleware.py"),
@@ -25,9 +28,12 @@ files = [
     # Handlers
     (r"bot\handlers\start.py", "/opt/antigravity-bot/bot/handlers/start.py"),
     (r"bot\handlers\chats.py", "/opt/antigravity-bot/bot/handlers/chats.py"),
+    (r"bot\handlers\dashboard.py", "/opt/antigravity-bot/bot/handlers/dashboard.py"),
+    (r"bot\handlers\settings.py", "/opt/antigravity-bot/bot/handlers/settings.py"),
     (r"bot\handlers\callbacks.py", "/opt/antigravity-bot/bot/handlers/callbacks.py"),
     (r"bot\handlers\message.py", "/opt/antigravity-bot/bot/handlers/message.py"),
     # Services
+    (r"bot\services\task_service.py", "/opt/antigravity-bot/bot/services/task_service.py"),
     (r"bot\services\agy_runner.py", "/opt/antigravity-bot/bot/services/agy_runner.py"),
     (r"bot\services\artifacts.py", "/opt/antigravity-bot/bot/services/artifacts.py"),
     (r"bot\services\permissions.py", "/opt/antigravity-bot/bot/services/permissions.py"),

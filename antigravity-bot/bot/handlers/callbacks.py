@@ -35,9 +35,93 @@ async def cb_perm_deny(cq: CallbackQuery, bot: Bot) -> None:
     await cq.answer(res)
 
 
+# ── Master Panel Callbacks ──────────────────────────────────────────────────
+
+@router.callback_query(F.data == "manage_sessions_menu:0")
+async def cb_manage_sessions_menu(cq: CallbackQuery, bot: Bot) -> None:
+    from bot.handlers.chats import build_sessions_manage_panel
+    text, kb = await build_sessions_manage_panel()
+    try:
+        await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        pass
+
+@router.callback_query(F.data == "back_to_master")
+async def cb_back_to_master(cq: CallbackQuery, bot: Bot) -> None:
+    from bot.handlers.chats import build_master_panel
+    text, kb = await build_master_panel()
+    try:
+        await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        pass
+
+@router.callback_query(F.data == "clean_dead_topics")
+async def cb_clean_dead_topics(cq: CallbackQuery, bot: Bot) -> None:
+    await cq.answer("Запуск проверки... Это может занять несколько секунд.", show_alert=False)
+    from bot.handlers.chats import purge_dead_topics, build_sessions_manage_panel
+    dead_count = await purge_dead_topics(bot)
+    
+    text, kb = await build_sessions_manage_panel()
+    try:
+        await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        pass
+    
+    await cq.answer(f"Проверка завершена. Удалено сессий: {dead_count}", show_alert=True)
+
+
+@router.callback_query(F.data == "purge_cli_sessions")
+async def cb_purge_cli_sessions(cq: CallbackQuery) -> None:
+    from bot.handlers.chats import purge_stale_cli_sessions
+    purged = purge_stale_cli_sessions()
+    await cq.answer(f"Удалено зависших процессов: {purged}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("kill_session:"))
+async def cb_kill_session(cq: CallbackQuery, bot: Bot) -> None:
+    parts = cq.data.split(":")  # type: ignore[union-attr]
+    if len(parts) < 2:
+        return
+    try:
+        tid = int(parts[1])
+    except ValueError:
+        return
+
+    # Delete session from DB
+    session = await db.delete_session(tid)
+    if not session:
+        await cq.answer(f"Сессия {tid} уже удалена.", show_alert=True)
+    else:
+        # Cleanup files
+        import shutil
+        workdir = session.get("workdir", "")
+        is_mounted = session.get("is_mounted", 0)
+        if not is_mounted and workdir and workdir.startswith(settings.workspaces_dir):
+            try:
+                shutil.rmtree(workdir, ignore_errors=True)
+            except Exception:
+                pass
+        await cq.answer(f"Сессия {tid} и её файлы удалены.", show_alert=False)
+
+    # Refresh manage panel in place
+    from bot.handlers.chats import build_sessions_manage_panel
+    text, kb = await build_sessions_manage_panel()
+    try:
+        await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data == "purge_cli_sessions")
+async def cb_purge_cli_sessions(cq: CallbackQuery, bot: Bot) -> None:
+    from bot.handlers.chats import purge_stale_cli_sessions
+    purged = purge_stale_cli_sessions()
+    await cq.answer(f"Успешно очищено зависших фоновых процессов: {purged}", show_alert=True)
+
+
 # ── Git View Diff ────────────────────────────────────────────────────────
 
-@router.callback_query(F.data.startswith("view_diff:"))
+@router.callback_query(F.data.startswith("t:df:") | F.data.startswith("view_diff:"))
 async def cb_view_diff(cq: CallbackQuery, bot: Bot) -> None:
     assert cq.from_user and cq.message
     thread_id = int(cq.data.split(":")[1])  # type: ignore[union-attr]
@@ -67,7 +151,7 @@ async def cb_view_diff(cq: CallbackQuery, bot: Bot) -> None:
 
 # ── Git Accept Diff ──────────────────────────────────────────────────────
 
-@router.callback_query(F.data.startswith("accept_diff:"))
+@router.callback_query(F.data.startswith("t:ac:") | F.data.startswith("accept_diff:"))
 async def cb_accept_diff(cq: CallbackQuery) -> None:
     assert cq.from_user and cq.message
     thread_id = int(cq.data.split(":")[1])  # type: ignore[union-attr]
@@ -164,7 +248,7 @@ async def cb_rollback(cq: CallbackQuery, bot: Bot) -> None:
 
 # ── Task Management Callbacks ──────────────────────────────────────────────
 
-@router.callback_query(F.data.startswith("cancel_task:"))
+@router.callback_query(F.data.startswith("t:st:") | F.data.startswith("cancel_task:"))
 async def cb_cancel_task(cq: CallbackQuery) -> None:
     assert cq.message
     from bot.handlers.message import _active_tasks
@@ -198,17 +282,17 @@ async def cb_cancel_gen_legacy(cq: CallbackQuery) -> None:
     await cq.answer("Используйте новую систему задач.", show_alert=True)
 
 
-@router.callback_query(F.data.startswith("task_status:"))
+@router.callback_query(F.data.startswith("t:ss:") | F.data.startswith("task_status:"))
 async def cb_task_status(cq: CallbackQuery) -> None:
     await cq.answer("Задача выполняется, пожалуйста подождите...", show_alert=True)
 
 
-@router.callback_query(F.data.startswith("retry_task:"))
+@router.callback_query(F.data.startswith("t:rt:") | F.data.startswith("retry_task:"))
 async def cb_retry_task(cq: CallbackQuery) -> None:
     await cq.answer("Повтор задачи пока не реализован.", show_alert=True)
 
 
-@router.callback_query(F.data.startswith("view_logs:"))
+@router.callback_query(F.data.startswith("t:lg:") | F.data.startswith("view_logs:"))
 async def cb_view_logs(cq: CallbackQuery) -> None:
     await cq.answer("Логи пока недоступны.", show_alert=True)
 
@@ -224,10 +308,39 @@ async def cb_clear_queue(cq: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("refresh_dashboard:"))
 async def cb_refresh_dashboard(cq: CallbackQuery, bot: Bot) -> None:
     from bot.handlers.dashboard import cmd_project
-    # Re-trigger cmd_project
-    await cq.message.delete()
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
     await cmd_project(cq.message, bot)
     await cq.answer("Обновлено")
+
+
+@router.callback_query(F.data.startswith("mount_info:"))
+async def cb_mount_info(cq: CallbackQuery) -> None:
+    await cq.answer(
+        "Чтобы привязать локальную папку сервера к этому топику, введите команду: /mount <абсолютный_путь>",
+        show_alert=True
+    )
+
+@router.callback_query(F.data.startswith("set_mode:"))
+async def cb_set_mode_quick(cq: CallbackQuery) -> None:
+    parts = cq.data.split(":")
+    mode = parts[1]
+    thread_id = int(parts[2])
+    await db.set_mode(thread_id, mode)
+    await cq.answer(f"Режим переключен на: {mode}")
+    # Refresh dashboard
+    from bot.handlers.dashboard import build_dashboard_content
+    text, kb = await build_dashboard_content(thread_id)
+    try:
+        await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        pass
+
+@router.callback_query(F.data.startswith("view_files:") | F.data.startswith("run_tests:") | F.data.startswith("run_deploy:") | F.data.startswith("server_panel:") | F.data.startswith("view_context:"))
+async def cb_placeholder_action(cq: CallbackQuery) -> None:
+    await cq.answer("Функция будет доступна в следующем релизе!", show_alert=True)
 
 
 # ── Web search toggle ────────────────────────────────────────────────────
@@ -239,9 +352,17 @@ async def cb_web_toggle(cq: CallbackQuery) -> None:
     new_val = await db.toggle_web_search(thread_id)
     session = await db.get_session(thread_id)
     if session:
-        await cq.message.edit_reply_markup(  # type: ignore[union-attr]
-            reply_markup=thread_settings_keyboard(thread_id, new_val),
-        )
+        if thread_id == 0:
+            from bot.handlers.chats import build_master_panel
+            text, kb = await build_master_panel()
+        else:
+            from bot.handlers.dashboard import build_dashboard_content
+            text, kb = await build_dashboard_content(thread_id)
+        
+        try:
+            await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass
     await cq.answer(f"Веб-поиск: {'ВКЛ' if new_val else 'ВЫКЛ'}")
 
 
@@ -262,10 +383,13 @@ async def cb_model_menu(cq: CallbackQuery) -> None:
         model_id = m.get("id", "")
         model_name = m.get("name", model_id)
         rows.append([InlineKeyboardButton(text=model_name, callback_data=f"model:{model_id}:{thread_id}")])
-    rows.append([InlineKeyboardButton(text="Сбросить (По умолчанию)", callback_data=f"model::{thread_id}")])
+    
+    rows.append([InlineKeyboardButton(text="Сбросить (Gemini 3.6 flash high)", callback_data=f"model::{thread_id}")])
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"back_to_dash:{thread_id}")])
+    
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
 
-    current = session.get("model", "") or "по умолчанию"
+    current = session.get("model", "") or "Gemini 3.6 flash (high)"
     await cq.message.edit_text(  # type: ignore[union-attr]
         f"Текущая модель: <b>{current}</b>\n\nВыберите модель:",
         parse_mode="HTML",
@@ -275,6 +399,24 @@ async def cb_model_menu(cq: CallbackQuery) -> None:
 
 
 # ── Model selection ──────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("back_to_dash:"))
+async def cb_back_to_dash(cq: CallbackQuery) -> None:
+    assert cq.message
+    thread_id = int(cq.data.split(":")[1])  # type: ignore[union-attr]
+    if thread_id == 0:
+        from bot.handlers.chats import build_master_panel
+        text, kb = await build_master_panel()
+    else:
+        from bot.handlers.dashboard import build_dashboard_content
+        text, kb = await build_dashboard_content(thread_id)
+        
+    try:
+        await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        pass
+    await cq.answer()
+
 
 @router.callback_query(F.data.startswith("model:"))
 async def cb_model(cq: CallbackQuery) -> None:
@@ -287,22 +429,29 @@ async def cb_model(cq: CallbackQuery) -> None:
         model = parts[1]
         thread_id = int(parts[2]) if parts[2] else None
     else:
-        model = parts[1] if len(parts) > 1 else ""
-        # Try to get thread_id from message context
+        model = parts[1]
+        thread_id = None
+
+    if not thread_id:
         thread_id = cq.message.message_thread_id  # type: ignore[union-attr]
-
-    if thread_id is None:
-        await cq.answer("Не удалось определить ветку", show_alert=True)
-        return
-
-    session = await db.get_session(thread_id)
-    if session:
-        await db.set_model(thread_id, model)
-        label = model or "по умолчанию"
-        await cq.message.edit_text(f"Модель изменена на: <b>{label}</b>", parse_mode="HTML")  # type: ignore[union-attr]
-        await cq.answer(f"Модель: {label}")
+        if thread_id is None:
+            await cq.answer("Не удалось определить ветку.")
+    await db.set_model(thread_id, model)
+    
+    # Refresh UI
+    if thread_id == 0:
+        from bot.handlers.chats import build_master_panel
+        text, kb = await build_master_panel()
     else:
-        await cq.answer("Сессия не найдена", show_alert=True)
+        from bot.handlers.dashboard import build_dashboard_content
+        text, kb = await build_dashboard_content(thread_id)
+        
+    try:
+        await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        pass
+    
+    await cq.answer("Изменения сохранены!")
 
 
 # ── Cancel (generic dismiss) ─────────────────────────────────────────────

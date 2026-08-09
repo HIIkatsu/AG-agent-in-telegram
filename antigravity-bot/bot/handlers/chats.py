@@ -52,39 +52,123 @@ def _is_general(message: Message) -> bool:
     return message.message_thread_id is None
 
 
-async def _master_panel(message: Message) -> None:
-    """Show Master control panel in General topic."""
+async def purge_dead_topics(bot: Bot) -> int:
+    """Check all active sessions and remove those where topic was deleted."""
     sessions = await db.list_all_sessions()
-
-    lines = [
-        "🏠 <b>Master Panel — Antigravity AI</b>\n",
-        f"📊 Активных сессий: <b>{len(sessions)}</b>\n",
-    ]
-
-    if sessions:
-        lines.append("─────────────────────")
-        for s in sessions[:15]:
-            mounted = "📌" if s.get("is_mounted") else "📁"
-            model = s.get("model") or "default"
-            web = "🌐" if s.get("web_search") else ""
-            workdir_short = s["workdir"][-35:] if len(s["workdir"]) > 35 else s["workdir"]
-            lines.append(
-                f"{mounted} <b>Thread {s['thread_id']}</b> | {model} {web}\n"
-                f"   └ <code>{workdir_short}</code>"
+    dead_count = 0
+    from aiogram.enums import ChatAction
+    from aiogram.exceptions import TelegramBadRequest
+    for s in sessions:
+        tid = s["thread_id"]
+        if tid == 0:
+            continue
+        try:
+            await bot.send_chat_action(
+                chat_id=settings.forum_group_id,
+                action=ChatAction.TYPING,
+                message_thread_id=tid
             )
-        lines.append("─────────────────────")
-    else:
-        lines.append("\n<i>Создайте новую ветку (Topic) в группе, чтобы начать.</i>")
+        except TelegramBadRequest as e:
+            err_str = str(e).lower()
+            if "message thread not found" in err_str or "topic deleted" in err_str or "thread not found" in err_str:
+                await db.delete_session(tid)
+                dead_count += 1
+                import shutil
+                workdir = s.get("workdir", "")
+                if workdir and workdir.startswith(settings.workspaces_dir):
+                    try:
+                        shutil.rmtree(workdir, ignore_errors=True)
+                    except Exception:
+                        pass
+            else:
+                import logging
+                logging.error(f"purge_dead_topics TelegramBadRequest: {e}")
+        except Exception as e:
+            import logging
+            logging.error(f"purge_dead_topics Exception: {e}")
+    return dead_count
 
-    lines.append(
-        "\n💡 <b>Команды:</b>\n"
-        "• <code>/settings</code> — эта панель\n"
-        "• <code>/stats</code> — статистика\n"
-        "• <code>/help</code> — справка\n\n"
-        "⚡ Для работы с агентом — пишите в ветки."
+
+async def build_master_panel() -> tuple[str, InlineKeyboardMarkup]:
+    """Build text and keyboard for Master Panel."""
+    sessions = await db.list_all_sessions()
+    sessions = [s for s in sessions if s["thread_id"] != 0]
+
+    glob = await db.get_global_settings()
+    glob_model = glob.get("model") or "Gemini 3.6 flash (high)"
+    glob_mode = glob.get("mode") or "code"
+    glob_web = glob.get("web_search") or "off"
+
+    text = (
+        "🌍 <b>Глобальные настройки (По умолчанию)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🤖 Дефолтная Модель: <b>{glob_model}</b>\n"
+        f"🧠 Дефолтный Режим: <b>{glob_mode}</b>\n"
+        f"🌐 Дефолтный Веб: <b>{glob_web}</b>\n\n"
+        f"📊 Активных проектов: <b>{len(sessions)}</b>"
     )
 
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🤖 Дефолтная Модель", callback_data="set_menu:model:0"),
+                InlineKeyboardButton(text="🧠 Дефолтный Режим", callback_data="set_menu:mode:0")
+            ],
+            [
+                InlineKeyboardButton(text="🌐 Дефолтный Веб", callback_data="set_menu:web:0")
+            ],
+            [
+                InlineKeyboardButton(text="🗑 Управление сессиями", callback_data="manage_sessions_menu:0"),
+            ],
+            [
+                InlineKeyboardButton(text="🧹 Очистка сессий (Зависшие)", callback_data="purge_cli_sessions")
+            ]
+        ]
+    )
+
+    return text, kb
+
+
+async def build_sessions_manage_panel() -> tuple[str, InlineKeyboardMarkup]:
+    """Build a specific panel for deleting sessions."""
+    sessions = await db.list_all_sessions()
+    sessions = [s for s in sessions if s["thread_id"] != 0]
+
+    lines = [
+        "🗑 <b>Управление сессиями</b>\n",
+        "Нажмите на ID сессии ниже, чтобы удалить её. Это полезно, если вы удалили ветку в Telegram, и бот не может убрать её автоматически.\n",
+    ]
+
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    rows = []
+    
+    if sessions:
+        current_row = []
+        for s in sessions[:30]:
+            tid = s["thread_id"]
+            tname = s.get("topic_name") or f"Thread {tid}"
+            # Shorten if too long
+            if len(tname) > 15:
+                tname = tname[:13] + ".."
+            current_row.append(InlineKeyboardButton(text=f"🗑 {tname}", callback_data=f"kill_session:{tid}"))
+            if len(current_row) == 2:
+                rows.append(current_row)
+                current_row = []
+        if current_row:
+            rows.append(current_row)
+            
+    rows.append([InlineKeyboardButton(text="🧹 Авто-очистка удаленных веток", callback_data="clean_dead_topics")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад в Master Panel", callback_data="back_to_master")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    return "\n".join(lines), kb
+
+
+async def _master_panel(message: Message) -> None:
+    """Show Master control panel in General topic."""
+    text, kb = await build_master_panel()
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 # ── /mount — bind a real project directory to this topic ─────────────────
@@ -139,40 +223,7 @@ async def cmd_pwd(message: Message) -> None:
     )
 
 
-# ── /settings — show config (Master panel in General, topic config in threads) ──
 
-@router.message(Command("settings"))
-async def cmd_settings(message: Message) -> None:
-    thread_id = _get_thread_id(message)
-
-    # General → Master Panel
-    if thread_id is None:
-        await _master_panel(message)
-        return
-
-    # Topic → per-topic settings
-    session = await db.get_or_create_session(thread_id)
-    web = "ВКЛ" if session.get("web_search") else "ВЫКЛ"
-    model = session.get("model") or "По умолчанию"
-    workdir = session.get("workdir", "—")
-    mounted = "✅ mount" if session.get("is_mounted") else "tmp"
-    # Compute the same deterministic UUIDv5 used for CLI conversations
-    import uuid as _uuid
-    _NAMESPACE_TG = _uuid.UUID('6ba7b810-9ed0-11d1-80b4-00c04fd430c8')
-    conv_id = str(_uuid.uuid5(_NAMESPACE_TG, f"thread-{thread_id}"))
-
-    text = (
-        f"⚙️ <b>Настройки ветки</b>\n\n"
-        f"• <b>Модель:</b> {model}\n"
-        f"• <b>Веб-поиск:</b> {web}\n"
-        f"• <b>Директория:</b> <code>{workdir}</code> ({mounted})\n"
-        f"• <b>Сессия agy:</b> <code>{conv_id[:18]}…</code>"
-    )
-    await message.answer(
-        text,
-        parse_mode="HTML",
-        reply_markup=thread_settings_keyboard(thread_id, bool(session.get("web_search"))),
-    )
 
 
 # ── /web — toggle web search ────────────────────────────────────────────

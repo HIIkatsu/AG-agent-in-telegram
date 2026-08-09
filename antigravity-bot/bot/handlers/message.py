@@ -43,6 +43,31 @@ def _normalize_filename(name: str) -> str:
     return name.strip('_') or "uploaded_file"
 
 
+@router.message(F.forum_topic_created)
+async def topic_created_handler(message: Message) -> None:
+    """Handle new topic creation to save its name."""
+    thread_id = message.message_thread_id
+    if not thread_id:
+        return
+    topic_name = message.forum_topic_created.name if message.forum_topic_created else "Новая ветка"
+    # Just update the DB if it exists, or create if not
+    session = await db.get_or_create_session(thread_id)
+    await db.conn.execute("UPDATE thread_sessions SET topic_name = ? WHERE thread_id = ?", (topic_name, thread_id))
+    await db.conn.commit()
+
+
+@router.message(F.forum_topic_edited)
+async def topic_edited_handler(message: Message) -> None:
+    """Handle topic rename."""
+    thread_id = message.message_thread_id
+    if not thread_id or not message.forum_topic_edited:
+        return
+    new_name = message.forum_topic_edited.name
+    if new_name:
+        await db.conn.execute("UPDATE thread_sessions SET topic_name = ? WHERE thread_id = ?", (new_name, thread_id))
+        await db.conn.commit()
+
+
 async def _typing_loop(bot: Bot, chat_id: int, stop_event: asyncio.Event, thread_id: int | None = None) -> None:
     """Send typing action periodically until stop_event is set."""
     while not stop_event.is_set():
@@ -100,11 +125,20 @@ async def _process(
         file_list = "\n".join(f"- {f}" for f in files)
         prompt = f"{text}\n\n[Прикрепленные файлы в рабочей директории:\n{file_list}]"
 
-    model: str = session.get("model", "") or ""
+    model: str = session.get("model", "") or "Gemini 3.6 flash (high)"
+    mode: str = session.get("mode", "code")
+    project_id: int = session.get("project_id", 0) or 0
     
     # Enqueue task to database
     from bot.services.task_service import enqueue_task, get_queued_count
-    await enqueue_task(thread_id, prompt, mode="code", model=model)
+    await enqueue_task(
+        thread_id=thread_id, 
+        chat_id=chat_id, 
+        project_id=project_id, 
+        prompt=prompt, 
+        mode=mode, 
+        model=model
+    )
     
     # Start loop if not running
     if thread_id not in _queue_loops:
@@ -135,6 +169,7 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
             task_id = task["id"]
             prompt = task["prompt"]
             model = task["model"]
+            mode = task.get("mode", "code")
             
             session = await db.get_session(thread_id)
             if not session:
@@ -142,7 +177,7 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 
             ws = session["workdir"]
             os.makedirs(ws, exist_ok=True)
-            web_search: bool = bool(session.get("web_search", 0))
+            web_search: str = session.get("web_search", "off")
 
             # Deterministic valid UUIDv5 based on thread_id
             import uuid as _uuid
@@ -165,7 +200,11 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
             t_reg = thread_messages_registry.setdefault(thread_id, [])
             t_reg.append(status_msg.message_id)
             
-            tracker = TaskTracker(bot, thread_id, status_msg, ws_dir=ws, commit_hash=commit_hash, task_id=task_id)
+            tracker = TaskTracker(
+                bot, thread_id, status_msg, ws_dir=ws, 
+                commit_hash=commit_hash, task_id=task_id, 
+                model=model, mode=mode
+            )
             await tracker.start()
 
             # Take snapshot of both workspace and agy scratchpad
@@ -183,6 +222,7 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                     tracker=tracker,
                     web_search=web_search,
                     model=model,
+                    mode=mode,
                     thread_id=thread_id,
                 ))
                 _active_tasks[thread_id] = (tracker, agy_task)

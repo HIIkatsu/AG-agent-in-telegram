@@ -60,14 +60,8 @@ def check_startup() -> None:
 async def _set_commands(bot: Bot) -> None:
     """Register native Telegram /command menu."""
     commands = [
-        BotCommand(command="mount", description="Привязать директорию проекта"),
-        BotCommand(command="pwd", description="Показать рабочую директорию"),
-        BotCommand(command="settings", description="Настройки ветки"),
-        BotCommand(command="web", description="Вкл/выкл веб-поиск"),
-        BotCommand(command="model", description="Выбор модели"),
-        BotCommand(command="stats", description="Статистика сессий"),
-        BotCommand(command="help", description="Справка"),
-        BotCommand(command="cleanup", description="Очистить битые сессии CLI"),
+        BotCommand(command="settings", description="Управление чатами и настройками"),
+        BotCommand(command="stats", description="Подробная статистика и лимиты"),
     ]
     await bot.set_my_commands(commands)
     logger.info("Bot commands registered")
@@ -83,6 +77,9 @@ async def main() -> None:
     purged = purge_stale_cli_sessions()
     if purged:
         logger.info("Startup cleanup: purged %d broken CLI sessions", purged)
+        
+    from bot.services.task_service import recovery_interrupted_tasks
+    await recovery_interrupted_tasks()
 
     bot = Bot(
         token=settings.bot_token,
@@ -103,12 +100,14 @@ async def main() -> None:
     from bot.handlers.start import router as start_router
     from bot.handlers.chats import router as chats_router
     from bot.handlers.dashboard import router as dashboard_router
+    from bot.handlers.settings import router as settings_router
     from bot.handlers.callbacks import router as callbacks_router
     from bot.handlers.message import router as message_router
 
     dp.include_router(start_router)
     dp.include_router(chats_router)
     dp.include_router(dashboard_router)
+    dp.include_router(settings_router)
     dp.include_router(callbacks_router)
     dp.include_router(message_router)  # catch-all MUST be last
 

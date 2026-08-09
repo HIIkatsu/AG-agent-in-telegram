@@ -54,13 +54,19 @@ _WEB_SEARCH_RULE = """
 """
 
 
-def _ensure_agents_md(workspace_dir: str, *, web_search: bool = False) -> None:
+def _ensure_agents_md(workspace_dir: str, mode: str = "code", web_search: str = "off") -> None:
     """Write/update .agents/AGENTS.md in workspace so CLI reads rules natively."""
     agents_dir = Path(workspace_dir) / ".agents"
     agents_dir.mkdir(exist_ok=True)
     rules_path = agents_dir / "AGENTS.md"
+    
+    from bot.modes import get_mode_config
+    cfg = get_mode_config(mode)
+    
     content = _AGENTS_MD_CONTENT
-    if web_search:
+    content += f"\n## Mode: {cfg['name']}\n- {cfg['prompt']}\n"
+    
+    if web_search in ("auto", "required"):
         content += _WEB_SEARCH_RULE
     try:
         # Only rewrite if content changed (avoid unnecessary disk writes)
@@ -79,13 +85,14 @@ async def run_agy(
     bot: Bot,
     chat_id: int,
     tracker: TaskTracker | None = None,
-    web_search: bool = False,
+    web_search: str = "off",
     model: str = "",
+    mode: str = "code",
     thread_id: int | None = None,
 ) -> str:
     """Execute agy CLI process with 5-minute timeout, STDIN permissions, backups, error capture, and Russian language enforcement."""
     os.makedirs(workspace_dir, exist_ok=True)
-    _ensure_agents_md(workspace_dir, web_search=web_search)
+    _ensure_agents_md(workspace_dir, mode=mode, web_search=web_search)
 
     # CLEAN prompt — no [SYSTEM:] injection. Rules come from .agents/AGENTS.md
     full_prompt = prompt
@@ -215,7 +222,7 @@ async def run_agy(
                                     tool_err = tool_info.get("error", {})
                                     err_msg = tool_err.get("message", str(tool_err)) if isinstance(tool_err, dict) else str(tool_err)
                                     if err_msg and "User denied permission" not in err_msg and "Permission denied" not in err_msg:
-                                        err_formatted = f"\n\n❌ <b>Ошибка инструмента ({tool_name}):</b>\n<pre><code>{err_msg}</code></pre>"
+                                        err_formatted = f"\n\n❌ **Ошибка инструмента ({tool_name}):**\n```\n{err_msg}\n```"
                                         full_response += err_formatted
                                         await on_chunk(err_formatted)
 
@@ -225,11 +232,18 @@ async def run_agy(
                         result_err = result.get("error", "")
                         response = result.get("response", "")
 
-                        if status == "ERROR" or result_err:
-                            err_formatted = f"\n\n❌ <b>Ошибка выполнения / Лимиты:</b>\n<pre><code>{result_err or 'Превышен лимит сообщений или ошибка модели.'}</code></pre>"
-                            full_response += err_formatted
-                            await on_chunk(err_formatted)
-                        elif isinstance(response, str) and response:
+                        if status == "ERROR":
+                            err_text = result_err or 'Превышен лимит сообщений или ошибка модели.'
+                            
+                            is_limit_error = any(kw in err_text.lower() for kw in ("limit", "token", "quota", "rate", "превышен", "ошибка модели"))
+                            has_response = isinstance(response, str) and len(response) > 20
+                            
+                            if is_limit_error or not has_response:
+                                err_formatted = f"\n\n❌ **Ошибка выполнения / Лимиты:**\n```\n{err_text}\n```"
+                                full_response += err_formatted
+                                await on_chunk(err_formatted)
+                        
+                        if isinstance(response, str) and response:
                             remainder = response[len(full_response):]
                             if remainder:
                                 full_response += remainder
@@ -255,7 +269,7 @@ async def run_agy(
             if proc.returncode and proc.returncode != 0:
                 logger.warning("agy process exited with code %d", proc.returncode)
                 if stderr_response.strip() and "Ошибка" not in full_response:
-                    err_msg = f"\n\n❌ <b>Ошибка выполнения:</b>\n<pre><code>{stderr_response.strip()[:1000]}</code></pre>"
+                    err_msg = f"\n\n❌ **Ошибка выполнения:**\n```\n{stderr_response.strip()[:1000]}\n```"
                     full_response += err_msg
                     await on_chunk(err_msg)
 
@@ -266,7 +280,7 @@ async def run_agy(
         except Exception:
             pass
         minutes = settings.task_timeout_seconds // 60
-        timeout_msg = f"\n\n❌ <b>Ошибка выполнения:</b>\n<pre><code>Превышен таймаут выполнения задачи ({minutes} минут). Процесс принудительно остановлен.</code></pre>"
+        timeout_msg = f"\n\n❌ **Ошибка выполнения:**\n```\nПревышен таймаут выполнения задачи ({minutes} минут). Процесс принудительно остановлен.\n```"
         full_response += timeout_msg
         await on_chunk(timeout_msg)
     except asyncio.CancelledError:
@@ -277,7 +291,7 @@ async def run_agy(
         raise
     except Exception as exc:
         logger.exception("agy execution error")
-        err_msg = f"\n\n❌ <b>Ошибка выполнения:</b>\n<pre><code>{exc}</code></pre>"
+        err_msg = f"\n\n❌ **Ошибка выполнения:**\n```\n{exc}\n```"
         full_response += err_msg
         await on_chunk(err_msg)
 
@@ -286,6 +300,15 @@ async def run_agy(
 
 
 def _tool_label(tool_name: str, parameters: dict) -> str:
+    # Use native agent toolAction or toolSummary if available
+    action = parameters.get("toolAction")
+    if action:
+        # Append file name if relevant
+        file_param = parameters.get("TargetFile") or parameters.get("AbsolutePath")
+        if file_param:
+            return f"{action}: {os.path.basename(str(file_param))}"
+        return str(action)
+        
     labels = {
         "run_command": f"Выполнение: {parameters.get('CommandLine', '')[:50]}",
         "write_to_file": f"Запись файла: {os.path.basename(str(parameters.get('TargetFile', '')))}",
