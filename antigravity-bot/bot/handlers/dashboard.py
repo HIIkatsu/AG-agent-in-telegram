@@ -75,11 +75,10 @@ async def build_dashboard_content(thread_id: int) -> tuple[str, InlineKeyboardMa
             ],
             [
                 InlineKeyboardButton(text="📁 Files", callback_data=f"view_files:{thread_id}"),
-                InlineKeyboardButton(text="🧪 Tests", callback_data=f"run_tests:{thread_id}"),
+                InlineKeyboardButton(text="🌿 Git History", callback_data=f"git_history:{thread_id}"),
             ],
             [
-                InlineKeyboardButton(text="🚀 Deploy", callback_data=f"run_deploy:{thread_id}"),
-                InlineKeyboardButton(text="🖥 Server", callback_data=f"server_panel:{thread_id}"),
+                InlineKeyboardButton(text="🚀 Deploy (Coming soon)", callback_data=f"run_deploy:{thread_id}"),
             ]
         ]
     )

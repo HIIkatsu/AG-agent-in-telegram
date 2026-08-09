@@ -19,6 +19,7 @@ files = [
     (r"config.json", "/opt/antigravity-bot/config.json"),
     (r"migrate.py", "/opt/antigravity-bot/migrate.py"),
     (r"migrate_phase2.py", "/opt/antigravity-bot/migrate_phase2.py"),
+    (r"migrate_phase3.py", "/opt/antigravity-bot/migrate_phase3.py"),
     # Core
     (r"bot\modes.py", "/opt/antigravity-bot/bot/modes.py"),
     (r"bot\config.py", "/opt/antigravity-bot/bot/config.py"),
@@ -30,6 +31,8 @@ files = [
     (r"bot\handlers\chats.py", "/opt/antigravity-bot/bot/handlers/chats.py"),
     (r"bot\handlers\dashboard.py", "/opt/antigravity-bot/bot/handlers/dashboard.py"),
     (r"bot\handlers\settings.py", "/opt/antigravity-bot/bot/handlers/settings.py"),
+    (r"bot\handlers\files.py", "/opt/antigravity-bot/bot/handlers/files.py"),
+    (r"bot\handlers\git_ui.py", "/opt/antigravity-bot/bot/handlers/git_ui.py"),
     (r"bot\handlers\callbacks.py", "/opt/antigravity-bot/bot/handlers/callbacks.py"),
     (r"bot\handlers\message.py", "/opt/antigravity-bot/bot/handlers/message.py"),
     # Services
@@ -56,9 +59,10 @@ for local_rel, remote in files:
 sftp.close()
 print(f"\nUploaded {len(files)} files")
 
-# Clear pyc cache + restart service
+# Clear pyc cache, run migration + restart service
 stdin, stdout, stderr = client.exec_command(
-    "find /opt/antigravity-bot -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null; "
+    "find /opt/antigravity-bot -name '*.pyc' -delete && "
+    "/opt/antigravity-bot/venv/bin/python /opt/antigravity-bot/migrate_phase3.py && "
     "systemctl restart antigravity-bot"
 )
 stdout.read()

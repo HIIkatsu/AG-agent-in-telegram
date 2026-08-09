@@ -51,8 +51,7 @@ async def cmd_settings(message: Message) -> None:
         await _master_panel(message)
         return
         
-    text, kb = await build_settings_main(thread_id)
-    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+    await message.reply("Настройки проекта теперь перенесены в дашборд. Пожалуйста, используйте команду /project")
 
 
 @router.callback_query(F.data.startswith("project_settings:"))

@@ -60,8 +60,11 @@ def check_startup() -> None:
 async def _set_commands(bot: Bot) -> None:
     """Register native Telegram /command menu."""
     commands = [
-        BotCommand(command="settings", description="Управление чатами и настройками"),
+        BotCommand(command="project", description="Дашборд и настройки проекта"),
+        BotCommand(command="files", description="Файловый менеджер проекта"),
+        BotCommand(command="git", description="История коммитов"),
         BotCommand(command="stats", description="Подробная статистика и лимиты"),
+        BotCommand(command="settings", description="Глобальные настройки (Мастер-панель)"),
     ]
     await bot.set_my_commands(commands)
     logger.info("Bot commands registered")
@@ -101,6 +104,8 @@ async def main() -> None:
     from bot.handlers.chats import router as chats_router
     from bot.handlers.dashboard import router as dashboard_router
     from bot.handlers.settings import router as settings_router
+    from bot.handlers.files import router as files_router
+    from bot.handlers.git_ui import router as git_router
     from bot.handlers.callbacks import router as callbacks_router
     from bot.handlers.message import router as message_router
 
@@ -108,6 +113,8 @@ async def main() -> None:
     dp.include_router(chats_router)
     dp.include_router(dashboard_router)
     dp.include_router(settings_router)
+    dp.include_router(files_router)
+    dp.include_router(git_router)
     dp.include_router(callbacks_router)
     dp.include_router(message_router)  # catch-all MUST be last
 

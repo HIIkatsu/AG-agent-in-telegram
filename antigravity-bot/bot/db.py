@@ -283,5 +283,35 @@ class Database:
         )
         return [dict(r) for r in await cur.fetchall()]
 
+    # ------------------------------------------------------------------
+    # Phase 3: callback_paths
+    # ------------------------------------------------------------------
+    async def save_callback_path(self, path: str) -> int:
+        """Save a long path and return its short ID."""
+        assert self._conn
+        # Try to insert or ignore if exists
+        await self._conn.execute(
+            "INSERT OR IGNORE INTO callback_paths (path) VALUES (?)",
+            (path,)
+        )
+        await self._conn.commit()
+        # Retrieve the ID
+        cur = await self._conn.execute(
+            "SELECT id FROM callback_paths WHERE path = ?",
+            (path,)
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+    async def get_callback_path(self, path_id: int) -> str | None:
+        """Get the long path by its ID."""
+        assert self._conn
+        cur = await self._conn.execute(
+            "SELECT path FROM callback_paths WHERE id = ?",
+            (path_id,)
+        )
+        row = await cur.fetchone()
+        return row[0] if row else None
+
 
 db = Database()
