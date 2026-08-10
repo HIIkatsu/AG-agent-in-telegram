@@ -32,7 +32,6 @@ async def build_settings_main(thread_id: int) -> tuple[str, InlineKeyboardMarkup
                 InlineKeyboardButton(text="📦 Артефакты", callback_data=f"set_menu:artifacts:{thread_id}"),
                 InlineKeyboardButton(text="🖥 Сервер", callback_data=f"set_menu:server:{thread_id}")
             ],
-            ],
             [
                 InlineKeyboardButton(text="◀️ Назад в Dashboard", callback_data=f"refresh_dashboard:{thread_id}")
             ]
