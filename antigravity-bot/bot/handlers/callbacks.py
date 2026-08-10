@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 
 from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
@@ -14,9 +13,22 @@ from bot.services.agy_runner import run_agy
 from bot.services.diff_viewer import generate_diff_html_file
 from bot.services.git_manager import git_manager
 from bot.services.permissions import permission_handler
-from bot.utils.keyboards import thread_settings_keyboard
 
 router = Router(name="callbacks")
+
+
+async def _resolve_thread_from_callback(last_part: str) -> int | None:
+    """Callbacks may carry either thread_id or task_id; resolve both safely."""
+    try:
+        value = int(last_part)
+    except ValueError:
+        return None
+    session = await db.get_session(value)
+    if session:
+        return value
+    from bot.services.task_service import get_task
+    task = await get_task(value)
+    return int(task["thread_id"]) if task else None
 
 
 # ── HITL Permission Callbacks ────────────────────────────────────────────
@@ -70,13 +82,6 @@ async def cb_clean_dead_topics(cq: CallbackQuery, bot: Bot) -> None:
     await cq.answer(f"Проверка завершена. Удалено сессий: {dead_count}", show_alert=True)
 
 
-@router.callback_query(F.data == "purge_cli_sessions")
-async def cb_purge_cli_sessions(cq: CallbackQuery) -> None:
-    from bot.handlers.chats import purge_stale_cli_sessions
-    purged = purge_stale_cli_sessions()
-    await cq.answer(f"Удалено зависших процессов: {purged}", show_alert=True)
-
-
 @router.callback_query(F.data.startswith("kill_session:"))
 async def cb_kill_session(cq: CallbackQuery, bot: Bot) -> None:
     parts = cq.data.split(":")  # type: ignore[union-attr]
@@ -125,7 +130,10 @@ async def cb_purge_cli_sessions(cq: CallbackQuery, bot: Bot) -> None:
 async def cb_view_diff(cq: CallbackQuery, bot: Bot) -> None:
     assert cq.from_user and cq.message
     parts = cq.data.split(":")  # type: ignore[union-attr]
-    thread_id = int(parts[-1])
+    thread_id = await _resolve_thread_from_callback(parts[-1])
+    if thread_id is None:
+        await cq.answer("Не удалось определить ветку", show_alert=True)
+        return
     session = await db.get_session(thread_id)
     if not session:
         await cq.answer("Сессия не найдена", show_alert=True)
@@ -155,7 +163,11 @@ async def cb_view_diff(cq: CallbackQuery, bot: Bot) -> None:
 @router.callback_query(F.data.startswith("t:ac:") | F.data.startswith("accept_diff:"))
 async def cb_accept_diff(cq: CallbackQuery) -> None:
     assert cq.from_user and cq.message
-    thread_id = int(cq.data.split(":")[1])  # type: ignore[union-attr]
+    parts = cq.data.split(":")  # type: ignore[union-attr]
+    thread_id = await _resolve_thread_from_callback(parts[-1])
+    if thread_id is None:
+        await cq.answer("Не удалось определить ветку", show_alert=True)
+        return
     session = await db.get_session(thread_id)
     if session:
         ws = session["workdir"]
@@ -285,17 +297,58 @@ async def cb_cancel_gen_legacy(cq: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("t:ss:") | F.data.startswith("task_status:"))
 async def cb_task_status(cq: CallbackQuery) -> None:
-    await cq.answer("Задача выполняется, пожалуйста подождите...", show_alert=True)
+    assert cq.message
+    from bot.handlers.ide import build_task_card
+    task_id = int(cq.data.split(":")[-1])  # type: ignore[union-attr]
+    text, kb = await build_task_card(task_id)
+    try:
+        await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        pass
+    await cq.answer("Статус обновлён")
 
 
 @router.callback_query(F.data.startswith("t:rt:") | F.data.startswith("retry_task:"))
-async def cb_retry_task(cq: CallbackQuery) -> None:
-    await cq.answer("Повтор задачи пока не реализован.", show_alert=True)
+async def cb_retry_task(cq: CallbackQuery, bot: Bot) -> None:
+    assert cq.message
+    from bot.services.task_service import enqueue_task, get_task
+    task_id = int(cq.data.split(":")[-1])  # type: ignore[union-attr]
+    task = await get_task(task_id)
+    if not task:
+        await cq.answer("Задача не найдена", show_alert=True)
+        return
+    new_id = await enqueue_task(
+        thread_id=task["thread_id"],
+        chat_id=task["chat_id"],
+        project_id=task.get("project_id") or 0,
+        prompt=task["prompt"],
+        mode=task.get("mode") or "code",
+        model=task.get("model"),
+        retry_of_task_id=task_id,
+    )
+    from bot.handlers.message import _process_queue, _queue_loops
+    if task["thread_id"] not in _queue_loops:
+        _queue_loops.add(task["thread_id"])
+        asyncio.create_task(_process_queue(task["thread_id"], bot, task["chat_id"]))
+    await cq.answer(f"Задача #{new_id} добавлена в очередь")
 
 
 @router.callback_query(F.data.startswith("t:lg:") | F.data.startswith("view_logs:"))
 async def cb_view_logs(cq: CallbackQuery) -> None:
-    await cq.answer("Логи пока недоступны.", show_alert=True)
+    assert cq.message
+    import html
+    task_id = int(cq.data.split(":")[-1])  # type: ignore[union-attr]
+    cur = await db.conn.execute("SELECT * FROM task_logs WHERE task_id = ? ORDER BY id DESC LIMIT 40", (task_id,))
+    rows = [dict(r) for r in await cur.fetchall()]
+    if not rows:
+        await cq.answer("Логов пока нет", show_alert=True)
+        return
+    rows.reverse()
+    text = "📄 <b>Логи задачи #{}</b>\n\n".format(task_id) + "\n".join(
+        f"• <code>{html.escape(r['level'])}</code> {html.escape(r['message'][:250])}" for r in rows
+    )
+    await cq.message.answer(text, parse_mode="HTML")
+    await cq.answer("Логи отправлены")
 
 
 @router.callback_query(F.data.startswith("clear_queue:"))
@@ -364,7 +417,7 @@ async def cb_web_toggle(cq: CallbackQuery) -> None:
             await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
         except Exception:
             pass
-    await cq.answer(f"Веб-поиск: {'ВКЛ' if new_val else 'ВЫКЛ'}")
+    await cq.answer(f"Веб-поиск: {new_val}")
 
 
 # ── Model selection menu ─────────────────────────────────────────────────

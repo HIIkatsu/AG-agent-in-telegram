@@ -2,14 +2,12 @@
 
 import html
 import os
-from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.filters import Command
 
 from bot.db import db
-from bot.config import settings
 
 router = Router(name="files")
 
@@ -40,7 +38,6 @@ async def build_file_explorer(thread_id: int, current_path: str) -> tuple[str, I
     if not is_dir:
         return f"Это файл: {current_path}", InlineKeyboardMarkup(inline_keyboard=[])
 
-    items = []
     try:
         entries = list(os.scandir(full_path))
     except Exception as e:
@@ -158,12 +155,14 @@ async def cb_open_file(cq: CallbackQuery, bot: Bot) -> None:
     
     if ext in binary_exts or file_size > 1024 * 1024:  # If binary or > 1MB
         doc = FSInputFile(full_path, filename=os.path.basename(full_path))
+        path_id = await db.save_callback_path(path)
         await bot.send_document(
             cq.message.chat.id,  # type: ignore[union-attr]
             doc,
             caption=f"📄 <b>{os.path.basename(full_path)}</b>",
             parse_mode="HTML",
-            message_thread_id=thread_id if thread_id != 0 else None
+            message_thread_id=thread_id if thread_id != 0 else None,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧠 В контекст", callback_data=f"ctx:add:{thread_id}:{path_id}")]])
         )
         return
 
@@ -216,11 +215,13 @@ async def cb_open_file(cq: CallbackQuery, bot: Bot) -> None:
         )
         return
 
+    path_id = await db.save_callback_path(path)
     await bot.send_message(
         cq.message.chat.id,  # type: ignore[union-attr]
         text,
         parse_mode="HTML",
-        message_thread_id=thread_id if thread_id != 0 else None
+        message_thread_id=thread_id if thread_id != 0 else None,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧠 В контекст", callback_data=f"ctx:add:{thread_id}:{path_id}")]])
     )
 
 @router.message(Command("files"))

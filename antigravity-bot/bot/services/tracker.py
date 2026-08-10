@@ -13,8 +13,7 @@ from aiogram import Bot
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot.services.git_manager import git_manager
-from bot.utils.formatting import chunk_text
-from bot.utils.sanitizer import clean_telegram_markdown
+from bot.utils.telegram_renderer import chunk_text, part_label, render_markdown, strip_telegram_html
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +123,9 @@ class TaskTracker:
             self.steps.append(step)
             self._current_step_idx = len(self.steps) - 1
 
+        if self.task_id:
+            from bot.services.task_service import log_task_event
+            await log_task_event(self.task_id, "tool_start", label, tool_name)
         await self.render(force=True)
 
     async def on_tool_end(self, tool_name: str, status: str = "DONE") -> None:
@@ -132,6 +134,9 @@ class TaskTracker:
             if self._current_step_idx is not None and self._current_step_idx < len(self.steps):
                 self.steps[self._current_step_idx].status = status
 
+        if self.task_id:
+            from bot.services.task_service import log_task_event
+            await log_task_event(self.task_id, f"tool_{status.lower()}", tool_name)
         await self.render(force=True)
 
     async def cancel(self) -> None:
@@ -140,6 +145,9 @@ class TaskTracker:
         self._finish_status = "CANCELLED"
         if self._render_task and not self._render_task.done():
             self._render_task.cancel()
+        if self.task_id:
+            from bot.services.task_service import log_task_event
+            await log_task_event(self.task_id, "cancelled", "Задача отменена пользователем")
         try:
             await self.status_msg.edit_text("Генерация отменена.")
         except Exception:
@@ -217,11 +225,12 @@ class TaskTracker:
                 step_lines.append(f"{prefix} [{icon}] {step.label}")
 
             if not final:
-                step_lines.append(f"└─ [⏳] Оформление ответа...")
+                step_lines.append("└─ [⏳] Оформление ответа...")
             elif steps_copy:
                 step_lines[-1] = step_lines[-1].replace("├─", "└─")
 
-        clean_text = clean_telegram_markdown(buffer_copy.strip())
+        rendered_response = render_markdown(buffer_copy.strip())
+        clean_text = rendered_response.html
         status = self._finish_status.lower() if final else "running"
         kb = build_tracker_kb(self.thread_id, ws_dir=self.ws_dir, status=status, commit_hash=self.commit_hash, task_id=self.task_id)
 
@@ -237,7 +246,7 @@ class TaskTracker:
                     if len(chunks) > 1:
                         reply_id = self.status_msg.reply_to_message.message_id if self.status_msg.reply_to_message else None
                         for i, chunk in enumerate(chunks[1:]):
-                            part_text = f"<i>(Часть {i+2}/{len(chunks)})</i>\n\n{chunk}"
+                            part_text = f"{part_label(i + 2, len(chunks))}{chunk}"
                             msg = await self.bot.send_message(
                                 chat_id=self.status_msg.chat.id,
                                 text=part_text,
@@ -293,7 +302,7 @@ class TaskTracker:
                     else:
                         reply_id = self.status_msg.reply_to_message.message_id if self.status_msg.reply_to_message else None
                         for i, chunk in enumerate(chunks):
-                            text_to_send = chunk if i == 0 else f"<i>(Часть {i+1}/{len(chunks)})</i>\n\n{chunk}"
+                            text_to_send = f"{part_label(i + 1, len(chunks))}{chunk}"
                             msg = await self.bot.send_message(
                                 chat_id=self.status_msg.chat.id,
                                 text=text_to_send,
@@ -349,7 +358,7 @@ class TaskTracker:
                     pass
             elif "can't parse entities" in err.lower():
                 try:
-                    await msg.edit_text(re.sub(r"<[^>]+>", "", html_text), reply_markup=reply_markup)
+                    await msg.edit_text(strip_telegram_html(html_text), reply_markup=reply_markup)
                 except Exception:
                     pass
 

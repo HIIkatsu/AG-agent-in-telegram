@@ -11,8 +11,6 @@ import os
 import re
 import tempfile
 import urllib.parse
-from typing import Any
-from collections import defaultdict
 
 from aiogram import Bot, F, Router
 from aiogram.types import Message
@@ -37,10 +35,14 @@ _queue_loops: set[int] = set()
 _VOICE_FRAMES = ["🎙 ⠋ Распознаю...", "🎙 ⠙ Распознаю...", "🎙 ⠹ Распознаю...", "🎙 ⠸ Распознаю..."]
 
 def _normalize_filename(name: str) -> str:
-    """Normalize uploaded filename to be safe."""
-    name = urllib.parse.unquote(name)
+    """Normalize uploaded filename to a safe basename with bounded length."""
+    name = os.path.basename(urllib.parse.unquote(name))
     name = re.sub(r'[^\w\.-]', '_', name)
-    return name.strip('_') or "uploaded_file"
+    name = re.sub(r'_+', '_', name).strip('._')
+    if not name:
+        return "uploaded_file"
+    stem, ext = os.path.splitext(name)
+    return f"{stem[:80]}{ext[:16]}"
 
 
 @router.message(F.forum_topic_created)
@@ -51,7 +53,7 @@ async def topic_created_handler(message: Message) -> None:
         return
     topic_name = message.forum_topic_created.name if message.forum_topic_created else "Новая ветка"
     # Just update the DB if it exists, or create if not
-    session = await db.get_or_create_session(thread_id)
+    await db.get_or_create_session(thread_id)
     await db.conn.execute("UPDATE thread_sessions SET topic_name = ? WHERE thread_id = ?", (topic_name, thread_id))
     await db.conn.commit()
 
@@ -119,11 +121,25 @@ async def _process(
     session = await db.get_or_create_session(thread_id)
     await db.update_last_used(thread_id)
 
-    # If files were attached, add them to prompt
+    # If files were attached, add them to prompt using workspace-relative paths only.
     prompt = text
+    prompt_sections: list[str] = []
     if files:
         file_list = "\n".join(f"- {f}" for f in files)
-        prompt = f"{text}\n\n[Прикрепленные файлы в рабочей директории:\n{file_list}]"
+        prompt_sections.append(f"Прикрепленные файлы в рабочей директории:\n{file_list}")
+
+    context_files = await db.list_context_files(thread_id)
+    if context_files:
+        ctx = "\n".join(f"- {row['path']}" for row in context_files[:30])
+        prompt_sections.append(f"Закрепленный контекст проекта:\n{ctx}")
+
+    memory_notes = await db.list_memory_notes(thread_id)
+    if memory_notes:
+        mem = "\n".join(f"- {row['note']}" for row in memory_notes[:20])
+        prompt_sections.append(f"Память проекта:\n{mem}")
+
+    if prompt_sections:
+        prompt = f"{text}\n\n[" + "\n\n".join(prompt_sections) + "]"
 
     model: str = session.get("model", "") or "Gemini 3.6 flash (high)"
     mode: str = session.get("mode", "code")
@@ -227,10 +243,16 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 ))
                 _active_tasks[thread_id] = (tracker, agy_task)
                 full_response = await agy_task
-                await finish_task(task_id, "done")
+                task_status = "timeout" if "Превышен таймаут" in full_response else "done"
+                await finish_task(task_id, task_status, result_summary=full_response[:1000])
             except asyncio.CancelledError:
                 full_response = ""
-                await finish_task(task_id, "interrupted")
+                task_status = "cancelled"
+                await finish_task(task_id, "cancelled", error="Cancelled by user")
+            except Exception as exc:
+                full_response = ""
+                task_status = "failed"
+                await finish_task(task_id, "failed", error=str(exc))
             finally:
                 stop_typing.set()
                 typing_task.cancel()
@@ -253,7 +275,7 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 else:
                     synced_files.append(fpath)
 
-            await tracker.finish()
+            await tracker.finish("TIMEOUT" if task_status == "timeout" else "ERROR" if task_status == "failed" else "CANCELLED" if task_status == "cancelled" else "DONE")
 
             if synced_files:
                 from bot.services.tracker import rollback_registry
@@ -297,7 +319,7 @@ async def on_photo(message: Message, bot: Bot) -> None:
     caption = message.caption or "Пользователь отправил фото. Проанализируй его."
     rel_path = f"uploads/{filename}"
     prompt = f"{caption}\n\n[Фото сохранено: {rel_path}]"
-    await _process(message, prompt, bot, files=[local_path])
+    await _process(message, prompt, bot, files=[rel_path])
 
 
 # -- Document / File --
@@ -333,7 +355,7 @@ async def on_document(message: Message, bot: Bot) -> None:
     caption = message.caption or f"Пользователь отправил файл: {filename}"
     rel_path = f"uploads/{filename}"
     prompt = f"{caption}\n\n[Файл сохранен: {rel_path}]"
-    await _process(message, prompt, bot, files=[local_path])
+    await _process(message, prompt, bot, files=[rel_path])
 
 
 # -- Voice --

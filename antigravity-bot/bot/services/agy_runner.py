@@ -12,7 +12,6 @@ from typing import Awaitable, Callable
 from aiogram import Bot
 
 from bot.config import settings
-from bot.services.backups import backup_manager
 from bot.services.permissions import permission_handler
 from bot.services.tracker import TaskTracker
 from bot.utils.sanitizer import IncrementalStreamDecoder
@@ -277,6 +276,7 @@ async def run_agy(
         logger.error("agy execution timed out (%ds limit)", settings.task_timeout_seconds)
         try:
             proc.kill()
+            await proc.wait()
         except Exception:
             pass
         minutes = settings.task_timeout_seconds // 60
@@ -286,6 +286,7 @@ async def run_agy(
     except asyncio.CancelledError:
         try:
             proc.kill()
+            await proc.wait()
         except Exception:
             pass
         raise

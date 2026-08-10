@@ -10,10 +10,9 @@ import logging
 import os
 import shutil
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.types import (
-    ForumTopicClosed,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -21,7 +20,6 @@ from aiogram.types import (
 
 from bot.config import settings
 from bot.db import db
-from bot.utils.keyboards import thread_settings_keyboard
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +188,7 @@ async def cmd_mount(message: Message) -> None:
         await message.answer(f"❌ Директория не найдена:\n<code>{abs_path}</code>", parse_mode="HTML")
         return
 
-    session = await db.get_or_create_session(thread_id)
+    await db.get_or_create_session(thread_id)
     await db.set_workdir(thread_id, abs_path, is_mounted=True)
 
     await message.answer(
@@ -237,7 +235,7 @@ async def cmd_web(message: Message) -> None:
 
     await db.get_or_create_session(thread_id)
     new_val = await db.toggle_web_search(thread_id)
-    await message.answer(f"Веб-поиск: <b>{'ВКЛ' if new_val else 'ВЫКЛ'}</b>", parse_mode="HTML")
+    await message.answer(f"Веб-поиск: <b>{new_val}</b>", parse_mode="HTML")
 
 
 # ── /model — select model ───────────────────────────────────────────────

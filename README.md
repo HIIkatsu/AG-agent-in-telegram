@@ -34,3 +34,26 @@ Telegram bot integration for **Antigravity CLI** agent execution, featuring mult
 1. Copy `.env.example` to `.env` and fill in your Telegram Bot credentials.
 2. Install dependencies: `pip install -r antigravity-bot/requirements.txt`.
 3. Deploy to VPS using `python quick_deploy.py`.
+
+## IDE Workflow Commands
+
+Inside a project forum topic the bot exposes a Telegram IDE workflow:
+
+- `/project` — project dashboard with branch, changed files, model/mode/web and quick actions.
+- `/files` — browse and open workspace files.
+- `/search <query>` — ripgrep-based filename/content search with ignored build/cache directories.
+- `/context` — show context; `/context add path`, `/context rm path`, `/context note text`, `/context clear` manage pinned task context.
+- `/memory` — show project memory; `/memory add text`, `/memory rm id` manage persistent project notes.
+- `/diff` — review changed files and open diff.html / patch / accept / rollback / tests.
+- `/test` — auto-detect and run the project test command.
+- `/run <command>` — run a managed command in the workspace and stream output.
+- `/queue`, `/status`, `/task <id>`, `/cancel` — manage the task queue and task cards.
+
+## Development Checks
+
+```bash
+pip install -r antigravity-bot/requirements.txt -r requirements-dev.txt
+python -m compileall antigravity-bot/bot antigravity-bot/migrate_phase3.py
+python -m pytest
+ruff check antigravity-bot tests
+```

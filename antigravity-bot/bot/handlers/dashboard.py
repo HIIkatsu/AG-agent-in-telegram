@@ -25,13 +25,12 @@ async def build_dashboard_content(thread_id: int) -> tuple[str, InlineKeyboardMa
     project_name = os.path.basename(ws)
     if not os.path.exists(ws):
         os.makedirs(ws, exist_ok=True)
-        git_manager.init(ws)
+        git_manager.init_workspace(ws)
 
     # Git stats
     branch = git_manager.get_current_branch(ws) or "N/A"
     try:
-        changes = git_manager.get_diff(ws)
-        changed_files_count = len(changes.splitlines()) if changes else 0
+        changed_files_count = len(git_manager.status(ws))
     except Exception:
         changed_files_count = 0
 
@@ -75,9 +74,14 @@ async def build_dashboard_content(thread_id: int) -> tuple[str, InlineKeyboardMa
             ],
             [
                 InlineKeyboardButton(text="📁 Files", callback_data=f"view_files:{thread_id}"),
-                InlineKeyboardButton(text="🌿 Git History", callback_data=f"git_history:{thread_id}"),
+                InlineKeyboardButton(text="👀 Diff", callback_data=f"open_diff:{thread_id}"),
             ],
             [
+                InlineKeyboardButton(text="🧠 Context", callback_data=f"open_context:{thread_id}"),
+                InlineKeyboardButton(text="🧪 Tests", callback_data=f"run_tests:{thread_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="🌿 Git History", callback_data=f"git_history:{thread_id}"),
                 InlineKeyboardButton(text="🚀 Deploy (Coming soon)", callback_data=f"run_deploy:{thread_id}"),
             ]
         ]
