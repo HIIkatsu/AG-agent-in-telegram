@@ -72,6 +72,7 @@ async def _set_commands(bot: Bot) -> None:
         BotCommand(command="status", description="Статус задачи"),
         BotCommand(command="cancel", description="Отменить текущую задачу"),
         BotCommand(command="git", description="История коммитов"),
+        BotCommand(command="memory", description="Глобальная память агента"),
         BotCommand(command="stats", description="Подробная статистика и лимиты"),
         BotCommand(command="settings", description="Глобальные настройки (Мастер-панель)"),
     ]
@@ -117,6 +118,7 @@ async def main() -> None:
     from bot.handlers.git_ui import router as git_router
     from bot.handlers.ide import router as ide_router
     from bot.handlers.callbacks import router as callbacks_router
+    from bot.handlers.memory import router as memory_router
     from bot.handlers.message import router as message_router
 
     dp.include_router(start_router)
@@ -127,6 +129,7 @@ async def main() -> None:
     dp.include_router(git_router)
     dp.include_router(ide_router)
     dp.include_router(callbacks_router)
+    dp.include_router(memory_router)
     dp.include_router(message_router)  # catch-all MUST be last
 
     logger.info(

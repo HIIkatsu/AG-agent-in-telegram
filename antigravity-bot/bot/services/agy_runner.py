@@ -58,6 +58,7 @@ def _ensure_agents_md(workspace_dir: str, mode: str = "code", web_search: str = 
     agents_dir = Path(workspace_dir) / ".agents"
     agents_dir.mkdir(exist_ok=True)
     rules_path = agents_dir / "AGENTS.md"
+    skills_path = agents_dir / "skills.json"
     
     from bot.modes import get_mode_config
     cfg = get_mode_config(mode)
@@ -67,13 +68,29 @@ def _ensure_agents_md(workspace_dir: str, mode: str = "code", web_search: str = 
     
     if web_search in ("auto", "required"):
         content += _WEB_SEARCH_RULE
+        
+    # Inject INSTRUCTIONS.md if it exists
+    bot_root = Path(__file__).resolve().parent.parent.parent
+    instructions_file = bot_root / "INSTRUCTIONS.md"
+    if instructions_file.exists():
+        try:
+            content += "\n" + instructions_file.read_text(encoding="utf-8") + "\n"
+        except OSError as exc:
+            logger.warning("Failed to read INSTRUCTIONS.md: %s", exc)
+
     try:
         # Only rewrite if content changed (avoid unnecessary disk writes)
-        if rules_path.exists() and rules_path.read_text(encoding="utf-8") == content:
-            return
-        rules_path.write_text(content, encoding="utf-8")
+        if not rules_path.exists() or rules_path.read_text(encoding="utf-8") != content:
+            rules_path.write_text(content, encoding="utf-8")
+            
+        # Write skills.json pointing to global skills folder
+        global_skills = bot_root / ".agents" / "skills"
+        skills_content = json.dumps({"inherits": [{"path": str(global_skills)}]}, indent=2)
+        if not skills_path.exists() or skills_path.read_text(encoding="utf-8") != skills_content:
+            skills_path.write_text(skills_content, encoding="utf-8")
+            
     except OSError as exc:
-        logger.warning("Failed to write AGENTS.md: %s", exc)
+        logger.warning("Failed to write AGENTS.md or skills.json: %s", exc)
 
 
 async def run_agy(

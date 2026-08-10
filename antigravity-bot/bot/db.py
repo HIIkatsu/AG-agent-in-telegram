@@ -120,6 +120,12 @@ CREATE TABLE IF NOT EXISTS background_processes (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS user_memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fact TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS command_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     thread_id INTEGER NOT NULL,
@@ -499,6 +505,33 @@ class Database:
         assert self._conn
         await self._conn.execute("DELETE FROM background_processes WHERE id = ?", (process_id,))
         await self._conn.commit()
+
+
+    # ------------------------------------------------------------------
+    # Personal Intelligence (Global User Memory)
+    # ------------------------------------------------------------------
+    async def add_user_memory(self, fact: str) -> bool:
+        assert self._conn
+        try:
+            await self._conn.execute(
+                "INSERT INTO user_memory (fact) VALUES (?)",
+                (fact,),
+            )
+            await self._conn.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            return False  # Already exists
+
+    async def get_all_user_memory(self) -> list[dict]:
+        assert self._conn
+        cur = await self._conn.execute("SELECT * FROM user_memory ORDER BY id ASC")
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def delete_user_memory(self, fact_id: int) -> bool:
+        assert self._conn
+        cur = await self._conn.execute("DELETE FROM user_memory WHERE id = ?", (fact_id,))
+        await self._conn.commit()
+        return cur.rowcount > 0
 
 
 db = Database()
