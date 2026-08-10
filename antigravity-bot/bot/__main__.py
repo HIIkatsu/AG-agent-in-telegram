@@ -120,6 +120,7 @@ async def main() -> None:
     from bot.handlers.callbacks import router as callbacks_router
     from bot.handlers.memory import router as memory_router
     from bot.handlers.message import router as message_router
+    from bot.handlers.environments import router as environments_router
 
     dp.include_router(start_router)
     dp.include_router(chats_router)
@@ -128,8 +129,9 @@ async def main() -> None:
     dp.include_router(files_router)
     dp.include_router(git_router)
     dp.include_router(ide_router)
-    dp.include_router(callbacks_router)
     dp.include_router(memory_router)
+    dp.include_router(environments_router)
+    dp.include_router(callbacks_router)
     dp.include_router(message_router)  # catch-all MUST be last
 
     logger.info(

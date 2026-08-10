@@ -42,7 +42,9 @@ stdin, stdout, stderr = client.exec_command(
     "find /opt/antigravity-bot -name '*.pyc' -delete && "
     "/opt/antigravity-bot/venv/bin/python /opt/antigravity-bot/migrate_phase3.py && "
     "/opt/antigravity-bot/venv/bin/python /opt/antigravity-bot/migrate_phase4.py && "
+    "/opt/antigravity-bot/venv/bin/python /opt/antigravity-bot/migrate_phase4_1.py && "
     "/opt/antigravity-bot/venv/bin/python /opt/antigravity-bot/migrate_memory.py && "
+    "/opt/antigravity-bot/venv/bin/pip install -r /opt/antigravity-bot/requirements.txt && "
     "systemctl restart antigravity-bot"
 )
 stdout.read()

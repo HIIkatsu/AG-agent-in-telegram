@@ -117,6 +117,7 @@ async def build_master_panel() -> tuple[str, InlineKeyboardMarkup]:
                 InlineKeyboardButton(text="🌐 Дефолтный Веб", callback_data="set_menu:web:0")
             ],
             [
+                InlineKeyboardButton(text="🖥 Серверы (SSH)", callback_data="env_manage_menu:0"),
                 InlineKeyboardButton(text="🗑 Управление сессиями", callback_data="manage_sessions_menu:0"),
             ],
             [

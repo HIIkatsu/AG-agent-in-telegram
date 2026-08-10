@@ -527,6 +527,36 @@ class Database:
         cur = await self._conn.execute("SELECT * FROM user_memory ORDER BY id ASC")
         return [dict(r) for r in await cur.fetchall()]
 
+    async def get_all_environments(self) -> list[dict]:
+        assert self._conn
+        cur = await self._conn.execute("SELECT * FROM environments ORDER BY id ASC")
+        return [dict(r) for r in await cur.fetchall()]
+        
+    async def get_environment_by_name(self, name: str) -> dict | None:
+        assert self._conn
+        cur = await self._conn.execute("SELECT * FROM environments WHERE name = ?", (name,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def get_environment_by_id(self, env_id: int) -> dict | None:
+        assert self._conn
+        cur = await self._conn.execute("SELECT * FROM environments WHERE id = ?", (env_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+        
+    async def add_environment(self, name: str, host: str, port: int, username: str, ssh_key_path: str) -> None:
+        assert self._conn
+        await self._conn.execute(
+            "INSERT OR REPLACE INTO environments (name, host, port, username, ssh_key_path) VALUES (?, ?, ?, ?, ?)",
+            (name, host, port, username, ssh_key_path)
+        )
+        await self._conn.commit()
+
+    async def delete_environment(self, env_id: int) -> None:
+        assert self._conn
+        await self._conn.execute("DELETE FROM environments WHERE id = ?", (env_id,))
+        await self._conn.commit()
+
     async def delete_user_memory(self, fact_id: int) -> bool:
         assert self._conn
         cur = await self._conn.execute("DELETE FROM user_memory WHERE id = ?", (fact_id,))

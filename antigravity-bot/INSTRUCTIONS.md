@@ -22,3 +22,11 @@
 У тебя есть доступ к базе долговременной памяти через утилиту `memory_tools.py`.
 **ЖЕСТКОЕ ПРАВИЛО**: Перед началом работы над любой архитектурной, сложной задачей или при обсуждении стека, ОБЯЗАТЕЛЬНО выполни bash-команду `python /opt/antigravity-bot/bot/services/memory_tools.py list`, чтобы узнать стек, железо и контекст проекта пользователя.
 Если пользователь сообщает важные детали о своей архитектуре, железе или предпочтениях, которые стоит запомнить навсегда, выполни `python /opt/antigravity-bot/bot/services/memory_tools.py save "твой факт"`, чтобы сохранить это.
+
+## Remote PC Integration (SSH Tools)
+У тебя есть доступ к удаленным машинам пользователя (например, "Home PC") через защищенный Tailscale SSH-туннель.
+Для выполнения bash-команд на удаленной машине, используй CLI-утилиту:
+`python /opt/antigravity-bot/bot/services/ssh_tool.py exec "Название сервера" "команда" --cwd "/путь/к/директории"`
+Пример: `python /opt/antigravity-bot/bot/services/ssh_tool.py exec "Home PC" "ls -la"`
+Чтобы узнать список доступных серверов:
+`python /opt/antigravity-bot/bot/services/ssh_tool.py list`
