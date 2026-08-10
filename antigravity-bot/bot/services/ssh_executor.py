@@ -47,21 +47,26 @@ async def execute_command(env_name: str, command: str, cwd: str | None = None) -
         return -1, "", f"SSH key not found at {ssh_key_path}"
 
     try:
-        async with asyncssh.connect(
-            host=env["host"],
-            port=env.get("port", 22),
-            username=env["username"],
-            client_keys=[ssh_key_path],
-            known_hosts=None  # Disable known_hosts check for simplicity in internal mesh
-        ) as conn:
-            
-            exec_cmd = command
-            if cwd:
-                exec_cmd = f"cd {cwd} && {command}"
+        async def _connect_and_run():
+            async with asyncssh.connect(
+                host=env["host"],
+                port=env.get("port", 22),
+                username=env["username"],
+                client_keys=[ssh_key_path],
+                known_hosts=None
+            ) as conn:
+                exec_cmd = command
+                if cwd:
+                    exec_cmd = f"cd {cwd} && {command}"
                 
-            result = await conn.run(exec_cmd, check=False)
-            return result.exit_status, result.stdout, result.stderr
+                result = await conn.run(exec_cmd, check=False)
+                return result.exit_status, result.stdout, result.stderr
 
+        return await asyncio.wait_for(_connect_and_run(), timeout=10.0)
+
+    except asyncio.TimeoutError:
+        logger.error(f"SSH connection to {env_name} timed out.")
+        return -1, "", f"Timeout: Could not connect to {env_name} within 10 seconds."
     except Exception as e:
         logger.error(f"SSH Execution error on {env_name}: {e}")
         return -1, "", str(e)
