@@ -109,6 +109,17 @@ CREATE TABLE IF NOT EXISTS project_memory (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS background_processes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id INTEGER NOT NULL,
+    project_id INTEGER,
+    type TEXT NOT NULL,
+    pid INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    url TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS command_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     thread_id INTEGER NOT NULL,
@@ -442,6 +453,51 @@ class Database:
             "UPDATE command_runs SET status = ?, finished_at = ?, output = ? WHERE id = ?",
             (status, _now(), output, run_id),
         )
+        await self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Phase 4: Background Processes
+    # ------------------------------------------------------------------
+    async def create_background_process(self, thread_id: int, project_id: int | None, type_: str, pid: int) -> int:
+        assert self._conn
+        cur = await self._conn.execute(
+            "INSERT INTO background_processes (thread_id, project_id, type, pid) VALUES (?, ?, ?, ?)",
+            (thread_id, project_id, type_, pid),
+        )
+        await self._conn.commit()
+        return cur.lastrowid
+
+    async def update_background_process(self, process_id: int, status: str, url: str | None = None) -> None:
+        assert self._conn
+        if url is not None:
+            await self._conn.execute(
+                "UPDATE background_processes SET status = ?, url = ? WHERE id = ?",
+                (status, url, process_id),
+            )
+        else:
+            await self._conn.execute(
+                "UPDATE background_processes SET status = ? WHERE id = ?",
+                (status, process_id),
+            )
+        await self._conn.commit()
+
+    async def get_background_process(self, process_id: int) -> dict | None:
+        assert self._conn
+        cur = await self._conn.execute("SELECT * FROM background_processes WHERE id = ?", (process_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def list_background_processes(self, thread_id: int, include_stopped: bool = False) -> list[dict]:
+        assert self._conn
+        if include_stopped:
+            cur = await self._conn.execute("SELECT * FROM background_processes WHERE thread_id = ? ORDER BY id DESC", (thread_id,))
+        else:
+            cur = await self._conn.execute("SELECT * FROM background_processes WHERE thread_id = ? AND status = 'running' ORDER BY id DESC", (thread_id,))
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def remove_background_process(self, process_id: int) -> None:
+        assert self._conn
+        await self._conn.execute("DELETE FROM background_processes WHERE id = ?", (process_id,))
         await self._conn.commit()
 
 

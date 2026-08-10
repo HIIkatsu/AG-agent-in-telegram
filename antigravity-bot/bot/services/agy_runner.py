@@ -113,11 +113,20 @@ async def run_agy(
 
     logger.info("agy start: conv=%s model='%s'", conversation_id, model or "default")
 
+    project_id_str = ""
+    if thread_id is not None:
+        from bot.db import db
+        session = await db.get_session(thread_id)
+        if session and session.get("project_id"):
+            project_id_str = str(session["project_id"])
+
     env = {
         **os.environ,
         "TERM": "dumb", "NO_COLOR": "1",
         "LANG": "ru_RU.UTF-8", "LC_ALL": "ru_RU.UTF-8",
         "PYTHONIOENCODING": "utf-8",
+        "AGY_TG_THREAD_ID": str(thread_id) if thread_id is not None else "",
+        "AGY_TG_PROJECT_ID": project_id_str,
     }
 
     proc = await asyncio.create_subprocess_exec(
