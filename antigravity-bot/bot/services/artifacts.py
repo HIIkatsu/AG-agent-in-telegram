@@ -28,7 +28,7 @@ _TRACK_EXT = (
 
 _DELIVER_EXT = {
     ".pdf", ".zip", ".tar", ".gz", ".rar", ".7z",
-    ".pptx", ".docx", ".xlsx",
+    ".pptx", ".docx", ".xlsx", ".html"
 }
 
 _DEFAULT_SCRATCH_DIRS = [

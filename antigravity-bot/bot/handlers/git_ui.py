@@ -119,14 +119,12 @@ async def cb_show_commit(cq: CallbackQuery, bot: Bot) -> None:
         await cq.answer("Не удалось получить изменения.", show_alert=True)
         return
 
-    if len(diff_output) > 3000:
-        # Send as patch file
-        import tempfile
-        patch_path = os.path.join(tempfile.gettempdir(), f"commit_{short_hash}.diff")
-        with open(patch_path, "w", encoding="utf-8") as f:
-            f.write(diff_output)
+    if len(diff_output) > 2000:
+        # Send as html file
+        from bot.services.diff_viewer import generate_diff_html_file
+        diff_path = generate_diff_html_file(diff_output, f"Commit {short_hash}")
             
-        doc = FSInputFile(patch_path, filename=f"{short_hash}.diff")
+        doc = FSInputFile(diff_path, filename=f"{short_hash}.diff.html")
         await bot.send_document(
             cq.message.chat.id,  # type: ignore[union-attr]
             doc,
