@@ -272,7 +272,8 @@ async def cb_cancel_task(cq: CallbackQuery) -> None:
         await cq.answer("Нечего отменять")
         return
 
-    task_id = int(cq.data.split(":")[1])
+    parts = cq.data.split(":")
+    task_id = int(parts[-1])
     
     # Check if running
     entry = _active_tasks.get(thread_id)
@@ -282,10 +283,13 @@ async def cb_cancel_task(cq: CallbackQuery) -> None:
             await tracker.cancel()
             if agy_task and not agy_task.done():
                 agy_task.cancel()
-            await cq.answer("Генерация отменена!")
+            from bot.services.task_service import cancel_queue
+            await cancel_queue(thread_id)
+            await cq.answer("Текущая генерация и вся очередь отменены!")
             return
             
     # If not running, just cancel in DB
+    from bot.services.task_service import cancel_task
     await cancel_task(task_id)
     await cq.answer("Задача отменена!")
 
