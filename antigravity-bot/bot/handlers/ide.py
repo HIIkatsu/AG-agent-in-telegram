@@ -304,7 +304,7 @@ def _detect_test_command(ws: str) -> str | None:
 
 async def _run_command_and_report(message: Message, ws: str, command: str, thread_id: int) -> None:
     run_id = await db.create_command_run(thread_id, command)
-    status_msg = await message.answer(f"▶️ <b>Запуск команды #{run_id}</b>\n<code>{html.escape(command)}</code>", parse_mode="HTML")
+    status_msg = await message.answer(f"🖥 <b>Терминал:</b> <code>starting</code>\n> {html.escape(command)}", parse_mode="HTML")
     proc = await asyncio.create_subprocess_shell(
         command,
         cwd=ws,
@@ -322,7 +322,10 @@ async def _run_command_and_report(message: Message, ws: str, command: str, threa
                 output += chunk.decode("utf-8", errors="ignore")
                 preview = html.escape(output[-2500:])
                 try:
-                    await status_msg.edit_text(f"▶️ <b>Команда #{run_id}</b>\n<code>{html.escape(command)}</code>\n\n<pre>{preview}</pre>", parse_mode="HTML")
+                    await status_msg.edit_text(
+                        f"🖥 <b>Терминал:</b> <code>running</code>\n> {html.escape(command)}\n\n<pre>{preview}</pre>",
+                        parse_mode="HTML"
+                    )
                 except Exception:
                     pass
             rc = await proc.wait()
@@ -335,7 +338,10 @@ async def _run_command_and_report(message: Message, ws: str, command: str, threa
     await db.finish_command_run(run_id, status, output[-12000:])
     rendered = render_markdown(output[-3500:]).html
     icon = "✅" if status == "done" else "❌" if status == "failed" else "⏱"
-    await status_msg.edit_text(f"{icon} <b>Команда #{run_id}: {status}</b>\n<code>{html.escape(command)}</code>\n\n<pre>{html.escape(strip_telegram_html(rendered))}</pre>", parse_mode="HTML")
+    await status_msg.edit_text(
+        f"{icon} <b>Терминал:</b> <code>{status}</code>\n> {html.escape(command)}\n\n<pre>{html.escape(strip_telegram_html(rendered))}</pre>",
+        parse_mode="HTML"
+    )
 
 
 @router.callback_query(F.data.startswith("diff_patch:"))
@@ -368,6 +374,10 @@ async def cb_run_tests(cq: CallbackQuery, bot: Bot) -> None:
         fake_message = cq.message
         await _run_command_and_report(fake_message, session["workdir"], cmd, thread_id)  # type: ignore[arg-type]
 
+
+@router.callback_query(F.data.startswith("prompt_run:"))
+async def cb_prompt_run(cq: CallbackQuery) -> None:
+    await cq.answer("Отправьте команду для выполнения в формате: /run <ваша команда>", show_alert=True)
 
 @router.callback_query(F.data.startswith("ctx:add:"))
 async def cb_context_add(cq: CallbackQuery) -> None:

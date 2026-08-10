@@ -52,23 +52,32 @@ async def build_git_history(thread_id: int) -> tuple[str, InlineKeyboardMarkup]:
         return "Коммитов пока нет.", InlineKeyboardMarkup(inline_keyboard=[])
 
     lines = log_output.splitlines()
-    text_lines = ["🌿 <b>Git History (Последние 10 коммитов)</b>\n"]
+    text_lines = ["🌿 <b>Git History</b>\n"]
     
-    keyboard = []
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    builder = InlineKeyboardBuilder()
     
     for line in lines:
         parts = line.split("|", 2)
         if len(parts) == 3:
             short_hash, author, msg = parts
-            text_lines.append(f"<code>{short_hash}</code> <b>{html.escape(author)}</b>: <i>{html.escape(msg)}</i>")
-            keyboard.append([InlineKeyboardButton(text=f"📜 Посмотреть Diff {short_hash}", callback_data=f"g:c:{short_hash}:{thread_id}")])
+            text_lines.append(f"• <code>{short_hash}</code> — {html.escape(msg)} <i>({html.escape(author)})</i>")
+            
+            # Extract first 2 words of the message
+            words = msg.split()
+            short_msg = " ".join(words[:2])
+            if len(words) > 2:
+                short_msg += "..."
+                
+            builder.add(InlineKeyboardButton(text=f"📜 {short_hash}: {short_msg}", callback_data=f"g:c:{short_hash}:{thread_id}"))
 
-    text_lines.append("\nНажмите на кнопку ниже, чтобы посмотреть изменения в коммите.")
+    text_lines.append("\nНажмите на коммит ниже, чтобы посмотреть изменения (diff).")
+    builder.adjust(2)
     
     # Back to dashboard button
-    keyboard.append([InlineKeyboardButton(text="🔙 Назад в Dashboard", callback_data=f"project_settings:{thread_id}")])
+    builder.row(InlineKeyboardButton(text="🔙 Назад в Dashboard", callback_data=f"project_settings:{thread_id}"))
 
-    return "\n".join(text_lines), InlineKeyboardMarkup(inline_keyboard=keyboard)
+    return "\n".join(text_lines), builder.as_markup()
 
 
 @router.callback_query(F.data.startswith("git_history:"))

@@ -57,35 +57,42 @@ async def build_file_explorer(thread_id: int, current_path: str) -> tuple[str, I
     folders.sort()
     files.sort()
 
-    keyboard = []
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    builder = InlineKeyboardBuilder()
+
+    # Build folder buttons
+    for folder in folders:
+        rel_path = os.path.join(current_path, folder).replace("\\", "/")
+        path_id = await db.save_callback_path(rel_path)
+        builder.add(InlineKeyboardButton(text=f"📁 {folder}", callback_data=f"f:dir:{thread_id}:{path_id}"))
+
+    # Build file buttons
+    for file in files:
+        rel_path = os.path.join(current_path, file).replace("\\", "/")
+        path_id = await db.save_callback_path(rel_path)
+        builder.add(InlineKeyboardButton(text=f"📄 {file}", callback_data=f"f:open:{thread_id}:{path_id}"))
+
+    builder.adjust(2)
     
-    # Add parent dir button if not in root
+    # Navigation row at the bottom
+    nav_row = []
     if current_path and current_path != ".":
         parent_path = os.path.dirname(current_path.rstrip("/"))
         if parent_path == current_path:
             parent_path = ""
         parent_id = await db.save_callback_path(parent_path)
         root_id = await db.save_callback_path("")
-        keyboard.append([
+        nav_row = [
             InlineKeyboardButton(text="🔙 Назад", callback_data=f"f:dir:{thread_id}:{parent_id}"),
             InlineKeyboardButton(text="🏠 В корень", callback_data=f"f:dir:{thread_id}:{root_id}")
-        ])
+        ]
+    
+    if nav_row:
+        builder.row(*nav_row)
 
-    # Build folder buttons
-    for folder in folders:
-        rel_path = os.path.join(current_path, folder).replace("\\", "/")
-        path_id = await db.save_callback_path(rel_path)
-        keyboard.append([InlineKeyboardButton(text=f"📁 {folder}", callback_data=f"f:dir:{thread_id}:{path_id}")])
-
-    # Build file buttons
-    for file in files:
-        rel_path = os.path.join(current_path, file).replace("\\", "/")
-        path_id = await db.save_callback_path(rel_path)
-        keyboard.append([InlineKeyboardButton(text=f"📄 {file}", callback_data=f"f:open:{thread_id}:{path_id}")])
-
-    kb = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    kb = builder.as_markup()
     display_path = current_path if current_path else "/"
-    text = f"📁 <b>File Explorer</b>\n\nТекущая папка: <code>{display_path}</code>"
+    text = f"📁 <b>File Explorer</b>\n\nПуть: <code>{display_path}</code>"
     return text, kb
 
 
