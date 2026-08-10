@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 from pathlib import Path
 
 from aiogram import Bot
@@ -28,10 +27,8 @@ _TRACK_EXT = (
 )
 
 _DELIVER_EXT = {
-    ".pdf", ".zip", ".tar", ".gz", ".rar", ".7z", 
-    ".pptx", ".docx", ".xlsx", ".csv", ".txt",
-    ".py", ".js", ".ts", ".jsx", ".tsx", ".html", ".css",
-    ".json", ".yaml", ".yml", ".md", ".sh", ".bat"
+    ".pdf", ".zip", ".tar", ".gz", ".rar", ".7z",
+    ".pptx", ".docx", ".xlsx",
 }
 
 _DEFAULT_SCRATCH_DIRS = [

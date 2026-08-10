@@ -6,6 +6,7 @@ keyed by `thread_id` (== message_thread_id from Telegram).
 
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import datetime, timezone
 
@@ -77,6 +78,46 @@ CREATE TABLE IF NOT EXISTS task_artifacts (
     content_path TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS callback_paths (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL UNIQUE,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS context_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id INTEGER NOT NULL,
+    path TEXT NOT NULL,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    UNIQUE(thread_id, path)
+);
+
+CREATE TABLE IF NOT EXISTS context_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id INTEGER NOT NULL,
+    note TEXT NOT NULL,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS project_memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id INTEGER NOT NULL,
+    note TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS command_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id INTEGER NOT NULL,
+    command TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    output TEXT
+);
 """
 
 
@@ -105,6 +146,7 @@ class Database:
     # lifecycle
     # ------------------------------------------------------------------
     async def connect(self) -> None:
+        os.makedirs(os.path.dirname(self._path), exist_ok=True)
         self._conn = await aiosqlite.connect(self._path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL")
@@ -250,6 +292,18 @@ class Database:
         )
         await self._conn.commit()
 
+    async def toggle_web_search(self, thread_id: int) -> str:
+        """Cycle web_search mode: off -> auto -> required -> off."""
+        session = await self.get_or_create_session(thread_id)
+        current = session.get("web_search", "off")
+        modes = ("off", "auto", "required")
+        try:
+            next_mode = modes[(modes.index(current) + 1) % len(modes)]
+        except ValueError:
+            next_mode = "off"
+        await self.set_web_search(thread_id, next_mode)
+        return next_mode
+
     async def set_mode(self, thread_id: int, mode: str) -> None:
         """Set agent mode."""
         assert self._conn
@@ -312,6 +366,83 @@ class Database:
         )
         row = await cur.fetchone()
         return row[0] if row else None
+
+    # ------------------------------------------------------------------
+    # Phase 3: IDE context and memory helpers
+    # ------------------------------------------------------------------
+    async def add_context_file(self, thread_id: int, path: str, pinned: bool = False) -> None:
+        assert self._conn
+        await self._conn.execute(
+            "INSERT OR REPLACE INTO context_files (thread_id, path, pinned, created_at) VALUES (?, ?, ?, ?)",
+            (thread_id, path, int(pinned), _now()),
+        )
+        await self._conn.commit()
+
+    async def remove_context_file(self, thread_id: int, path: str) -> None:
+        assert self._conn
+        await self._conn.execute("DELETE FROM context_files WHERE thread_id = ? AND path = ?", (thread_id, path))
+        await self._conn.commit()
+
+    async def clear_context(self, thread_id: int) -> None:
+        assert self._conn
+        await self._conn.execute("DELETE FROM context_files WHERE thread_id = ?", (thread_id,))
+        await self._conn.execute("DELETE FROM context_notes WHERE thread_id = ?", (thread_id,))
+        await self._conn.commit()
+
+    async def list_context_files(self, thread_id: int) -> list[dict]:
+        assert self._conn
+        cur = await self._conn.execute("SELECT * FROM context_files WHERE thread_id = ? ORDER BY pinned DESC, path", (thread_id,))
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def add_context_note(self, thread_id: int, note: str, pinned: bool = False) -> int:
+        assert self._conn
+        cur = await self._conn.execute(
+            "INSERT INTO context_notes (thread_id, note, pinned, created_at) VALUES (?, ?, ?, ?)",
+            (thread_id, note, int(pinned), _now()),
+        )
+        await self._conn.commit()
+        return cur.lastrowid
+
+    async def list_context_notes(self, thread_id: int) -> list[dict]:
+        assert self._conn
+        cur = await self._conn.execute("SELECT * FROM context_notes WHERE thread_id = ? ORDER BY pinned DESC, id DESC", (thread_id,))
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def add_memory_note(self, thread_id: int, note: str) -> int:
+        assert self._conn
+        cur = await self._conn.execute(
+            "INSERT INTO project_memory (thread_id, note, created_at) VALUES (?, ?, ?)",
+            (thread_id, note, _now()),
+        )
+        await self._conn.commit()
+        return cur.lastrowid
+
+    async def delete_memory_note(self, note_id: int, thread_id: int) -> None:
+        assert self._conn
+        await self._conn.execute("DELETE FROM project_memory WHERE id = ? AND thread_id = ?", (note_id, thread_id))
+        await self._conn.commit()
+
+    async def list_memory_notes(self, thread_id: int) -> list[dict]:
+        assert self._conn
+        cur = await self._conn.execute("SELECT * FROM project_memory WHERE thread_id = ? ORDER BY id DESC", (thread_id,))
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def create_command_run(self, thread_id: int, command: str) -> int:
+        assert self._conn
+        cur = await self._conn.execute(
+            "INSERT INTO command_runs (thread_id, command, status, started_at) VALUES (?, ?, 'running', ?)",
+            (thread_id, command, _now()),
+        )
+        await self._conn.commit()
+        return cur.lastrowid
+
+    async def finish_command_run(self, run_id: int, status: str, output: str) -> None:
+        assert self._conn
+        await self._conn.execute(
+            "UPDATE command_runs SET status = ?, finished_at = ?, output = ? WHERE id = ?",
+            (status, _now(), output, run_id),
+        )
+        await self._conn.commit()
 
 
 db = Database()

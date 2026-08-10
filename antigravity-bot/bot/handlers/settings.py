@@ -1,6 +1,6 @@
 """Settings router and screens."""
 
-from aiogram import Bot, F, Router
+from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -12,7 +12,7 @@ router = Router(name="settings")
 
 
 async def build_settings_main(thread_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    session = await db.get_or_create_session(thread_id)
+    await db.get_or_create_session(thread_id)
     text = (
         "⚙️ <b>Настройки проекта</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"

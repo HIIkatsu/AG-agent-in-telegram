@@ -62,6 +62,15 @@ async def _set_commands(bot: Bot) -> None:
     commands = [
         BotCommand(command="project", description="Дашборд и настройки проекта"),
         BotCommand(command="files", description="Файловый менеджер проекта"),
+        BotCommand(command="search", description="Поиск по проекту"),
+        BotCommand(command="context", description="Контекст задачи"),
+        BotCommand(command="memory", description="Память проекта"),
+        BotCommand(command="diff", description="Diff workflow"),
+        BotCommand(command="test", description="Запустить тесты"),
+        BotCommand(command="run", description="Запустить команду"),
+        BotCommand(command="queue", description="Очередь задач"),
+        BotCommand(command="status", description="Статус задачи"),
+        BotCommand(command="cancel", description="Отменить текущую задачу"),
         BotCommand(command="git", description="История коммитов"),
         BotCommand(command="stats", description="Подробная статистика и лимиты"),
         BotCommand(command="settings", description="Глобальные настройки (Мастер-панель)"),
@@ -106,6 +115,7 @@ async def main() -> None:
     from bot.handlers.settings import router as settings_router
     from bot.handlers.files import router as files_router
     from bot.handlers.git_ui import router as git_router
+    from bot.handlers.ide import router as ide_router
     from bot.handlers.callbacks import router as callbacks_router
     from bot.handlers.message import router as message_router
 
@@ -115,6 +125,7 @@ async def main() -> None:
     dp.include_router(settings_router)
     dp.include_router(files_router)
     dp.include_router(git_router)
+    dp.include_router(ide_router)
     dp.include_router(callbacks_router)
     dp.include_router(message_router)  # catch-all MUST be last
 

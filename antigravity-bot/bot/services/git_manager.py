@@ -48,6 +48,13 @@ class GitManager:
         res = _run_git(ws_dir, "rev-parse", "--abbrev-ref", "HEAD")
         return res.stdout.strip()
 
+    def status(self, ws_dir: str) -> list[str]:
+        """Return porcelain status lines for the workspace."""
+        self.init_workspace(ws_dir)
+        _run_git(ws_dir, "add", "-N", ".")
+        res = _run_git(ws_dir, "status", "--porcelain")
+        return [line for line in res.stdout.splitlines() if line.strip()]
+
     def create_checkpoint(self, ws_dir: str, label: str = "checkpoint") -> str:
         """Create a commit snapshot before starting a new task and return its commit hash."""
         self.init_workspace(ws_dir)
