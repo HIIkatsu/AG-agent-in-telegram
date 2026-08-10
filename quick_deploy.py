@@ -1,4 +1,4 @@
-"""Deploy Forum Topics architecture to VPS — full file list."""
+"""Deploy Forum Topics architecture to VPS — recursive file list."""
 
 import io
 import os
@@ -13,58 +13,36 @@ client.connect("87.58.205.235", port=22, username="root", password="sJjuXb4MB3fz
 sftp = client.open_sftp()
 
 base = r"c:\Users\hiika\Desktop\Gemini_bot\antigravity-bot"
-files = [
-    # Config + env
-    (r".env", "/opt/antigravity-bot/.env"),
-    (r"config.json", "/opt/antigravity-bot/config.json"),
-    (r"migrate.py", "/opt/antigravity-bot/migrate.py"),
-    (r"migrate_phase2.py", "/opt/antigravity-bot/migrate_phase2.py"),
-    (r"migrate_phase3.py", "/opt/antigravity-bot/migrate_phase3.py"),
-    # Core
-    (r"bot\modes.py", "/opt/antigravity-bot/bot/modes.py"),
-    (r"bot\config.py", "/opt/antigravity-bot/bot/config.py"),
-    (r"bot\db.py", "/opt/antigravity-bot/bot/db.py"),
-    (r"bot\middleware.py", "/opt/antigravity-bot/bot/middleware.py"),
-    (r"bot\__main__.py", "/opt/antigravity-bot/bot/__main__.py"),
-    # Handlers
-    (r"bot\handlers\start.py", "/opt/antigravity-bot/bot/handlers/start.py"),
-    (r"bot\handlers\chats.py", "/opt/antigravity-bot/bot/handlers/chats.py"),
-    (r"bot\handlers\dashboard.py", "/opt/antigravity-bot/bot/handlers/dashboard.py"),
-    (r"bot\handlers\settings.py", "/opt/antigravity-bot/bot/handlers/settings.py"),
-    (r"bot\handlers\files.py", "/opt/antigravity-bot/bot/handlers/files.py"),
-    (r"bot\handlers\git_ui.py", "/opt/antigravity-bot/bot/handlers/git_ui.py"),
-    (r"bot\handlers\callbacks.py", "/opt/antigravity-bot/bot/handlers/callbacks.py"),
-    (r"bot\handlers\message.py", "/opt/antigravity-bot/bot/handlers/message.py"),
-    # Services
-    (r"bot\services\task_service.py", "/opt/antigravity-bot/bot/services/task_service.py"),
-    (r"bot\services\agy_runner.py", "/opt/antigravity-bot/bot/services/agy_runner.py"),
-    (r"bot\services\artifacts.py", "/opt/antigravity-bot/bot/services/artifacts.py"),
-    (r"bot\services\permissions.py", "/opt/antigravity-bot/bot/services/permissions.py"),
-    (r"bot\services\tracker.py", "/opt/antigravity-bot/bot/services/tracker.py"),
-    (r"bot\services\git_manager.py", "/opt/antigravity-bot/bot/services/git_manager.py"),
-    (r"bot\services\diff_viewer.py", "/opt/antigravity-bot/bot/services/diff_viewer.py"),
-    (r"bot\services\backups.py", "/opt/antigravity-bot/bot/services/backups.py"),
-    (r"bot\services\streaming.py", "/opt/antigravity-bot/bot/services/streaming.py"),
-    # Utils
-    (r"bot\utils\keyboards.py", "/opt/antigravity-bot/bot/utils/keyboards.py"),
-    (r"bot\utils\sanitizer.py", "/opt/antigravity-bot/bot/utils/sanitizer.py"),
-    (r"bot\utils\formatting.py", "/opt/antigravity-bot/bot/utils/formatting.py"),
-    (r"bot\utils\telegram_renderer.py", "/opt/antigravity-bot/bot/utils/telegram_renderer.py"),
-    (r"bot\handlers\ide.py", "/opt/antigravity-bot/bot/handlers/ide.py"),
-]
 
-for local_rel, remote in files:
-    local_path = os.path.join(base, local_rel)
-    sftp.put(local_path, remote)
-    print(f"  [PUT] {remote}")
+def upload_dir(local_dir, remote_dir):
+    try:
+        sftp.mkdir(remote_dir)
+    except IOError:
+        pass
+    for item in os.listdir(local_dir):
+        if item in ('.git', '__pycache__', 'venv', 'node_modules', '.idea', '.vscode', '.env.example'):
+            continue
+        local_path = os.path.join(local_dir, item)
+        remote_path = remote_dir + "/" + item
+        if os.path.isfile(local_path):
+            sftp.put(local_path, remote_path)
+            print(f"  [PUT] {remote_path}")
+        elif os.path.isdir(local_path):
+            upload_dir(local_path, remote_path)
+
+print("Starting recursive upload...")
+upload_dir(base, "/opt/antigravity-bot")
 
 sftp.close()
-print(f"\nUploaded {len(files)} files")
+print(f"\nUpload complete.")
 
 # Clear pyc cache, run migration + restart service
+print("Running migrations and restarting service...")
 stdin, stdout, stderr = client.exec_command(
     "find /opt/antigravity-bot -name '*.pyc' -delete && "
     "/opt/antigravity-bot/venv/bin/python /opt/antigravity-bot/migrate_phase3.py && "
+    "/opt/antigravity-bot/venv/bin/python /opt/antigravity-bot/migrate_phase4.py && "
+    "/opt/antigravity-bot/venv/bin/python /opt/antigravity-bot/migrate_memory.py && "
     "systemctl restart antigravity-bot"
 )
 stdout.read()
