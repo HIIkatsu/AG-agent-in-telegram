@@ -124,7 +124,8 @@ async def cb_purge_cli_sessions(cq: CallbackQuery, bot: Bot) -> None:
 @router.callback_query(F.data.startswith("t:df:") | F.data.startswith("view_diff:"))
 async def cb_view_diff(cq: CallbackQuery, bot: Bot) -> None:
     assert cq.from_user and cq.message
-    thread_id = int(cq.data.split(":")[1])  # type: ignore[union-attr]
+    parts = cq.data.split(":")  # type: ignore[union-attr]
+    thread_id = int(parts[-1])
     session = await db.get_session(thread_id)
     if not session:
         await cq.answer("Сессия не найдена", show_alert=True)
