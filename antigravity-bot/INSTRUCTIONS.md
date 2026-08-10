@@ -30,3 +30,12 @@
 Пример: `python /opt/antigravity-bot/bot/services/ssh_tool.py exec "Home PC" "ls -la"`
 Чтобы узнать список доступных серверов:
 `python /opt/antigravity-bot/bot/services/ssh_tool.py list`
+
+**ВАЖНОЕ ПРАВИЛО:** 
+Перед выполнением любых задач на удаленных ПК, убедись, что ПК в сети (используя `ssh_tool.py exec`). 
+Если сервер недоступен, ты должен автономно разбудить его с помощью утилиты управления питанием:
+`python /opt/antigravity-bot/bot/services/power_tool.py wakeup 'Имя Розетки'`
+(чтобы узнать имя розетки, выполни `python /opt/antigravity-bot/bot/services/power_tool.py list`).
+После wakeup дождись загрузки ПК (`sleep 60`) и повтори попытку выполнения задачи.
+Для мягкого выключения ПК используй:
+`python /opt/antigravity-bot/bot/services/power_tool.py shutdown "Home PC"`

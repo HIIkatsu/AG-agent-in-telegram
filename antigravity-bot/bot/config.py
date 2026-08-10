@@ -10,6 +10,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    # GitHub
+    github_token: str | None = None
+    
+    # Xiaomi Cloud
+    xiaomi_user: str | None = None
+    xiaomi_pass: str | None = None
+    xiaomi_server: str = "ru"
+
     model_config = SettingsConfigDict(
         env_file=(".env", "./antigravity-bot/.env", "/opt/antigravity-bot/.env"),
         env_file_encoding="utf-8",
