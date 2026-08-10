@@ -49,6 +49,8 @@ files = [
     (r"bot\utils\keyboards.py", "/opt/antigravity-bot/bot/utils/keyboards.py"),
     (r"bot\utils\sanitizer.py", "/opt/antigravity-bot/bot/utils/sanitizer.py"),
     (r"bot\utils\formatting.py", "/opt/antigravity-bot/bot/utils/formatting.py"),
+    (r"bot\utils\telegram_renderer.py", "/opt/antigravity-bot/bot/utils/telegram_renderer.py"),
+    (r"bot\handlers\ide.py", "/opt/antigravity-bot/bot/handlers/ide.py"),
 ]
 
 for local_rel, remote in files:

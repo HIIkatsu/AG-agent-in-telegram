@@ -282,6 +282,24 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 rlist = rollback_registry.setdefault(status_msg.message_id, [])
                 await deliver_and_cleanup_artifacts(bot, chat_id, synced_files, thread_id=thread_id, rollback_list=rlist)
 
+                # Auto-generate and send diff.html
+                raw_diff = git_manager.get_diff(ws)
+                if raw_diff and raw_diff.strip():
+                    from bot.services.diff_viewer import generate_diff_html_file
+                    try:
+                        diff_file_path = generate_diff_html_file(raw_diff, f"Task {task_id}")
+                        doc = FSInputFile(diff_file_path, filename="diff.html")
+                        await bot.send_document(
+                            chat_id, 
+                            doc, 
+                            caption="👀 <b>Изменения (diff.html):</b>\nОткройте файл в браузере для просмотра.", 
+                            parse_mode="HTML", 
+                            message_thread_id=thread_id
+                        )
+                    except Exception as e:
+                        import logging
+                        logging.getLogger(__name__).warning("Failed to auto-send diff.html: %s", e)
+
             await asyncio.sleep(0.5)
             
     finally:
