@@ -13,7 +13,7 @@ import tempfile
 import urllib.parse
 
 from aiogram import Bot, F, Router
-from aiogram.types import Message
+from aiogram.types import FSInputFile, Message
 
 from bot.config import settings
 from bot.db import db
