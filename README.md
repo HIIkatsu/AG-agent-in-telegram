@@ -9,7 +9,6 @@ Telegram bot integration for **Antigravity CLI** agent execution, featuring mult
 - 🎤 **Voice Support**: Instant voice message transcription via cloud STT (Groq with Wit.ai fallback).
 - 🔄 **Git Checkpoints & Rollback**: Automatic workspace checkpoints before tasks with side-by-side diff viewing and one-click rollback.
 - 🛡️ **Native Rules**: Uses `.agents/AGENTS.md` rules for agent behavior control.
-- 🚀 **One-Click Deploy**: Automated SSH deployment script for Linux VPS.
 
 ## Project Structure
 
@@ -24,16 +23,13 @@ Telegram bot integration for **Antigravity CLI** agent execution, featuring mult
 │   │   └── db.py           # SQLite session management
 │   ├── .env.example
 │   └── requirements.txt
-├── deploy.py               # VPS deployment script
-├── quick_deploy.py         # Fast SSH sync script
 └── README.md
 ```
 
-## Setup & Deployment
+## Setup
 
 1. Copy `.env.example` to `.env` and fill in your Telegram Bot credentials.
 2. Install dependencies: `pip install -r antigravity-bot/requirements.txt`.
-3. Deploy to VPS using `python quick_deploy.py`.
 
 ## IDE Workflow Commands
 
