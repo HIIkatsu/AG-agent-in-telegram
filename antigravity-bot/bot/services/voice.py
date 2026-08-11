@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 GROQ_TRANSCRIPTIONS_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "whisper-large-v3-turbo"
-WIT_DICTATION_URL = "https://api.wit.ai/dictation"
+WIT_DICTATION_URL = "https://api.wit.ai/dictation?v=20240215"
 HTTP_TIMEOUT_SECONDS = 60
 
 
@@ -52,7 +52,9 @@ async def _convert_ogg_to_wav(ogg_path: str) -> str:
 
 async def transcribe_with_groq(audio_path: str) -> str:
     """Transcribe an audio file via Groq's OpenAI-compatible transcription API."""
-    api_key = os.getenv("GROQ_API_KEY")
+    from bot.config import settings
+
+    api_key = settings.groq_api_key
     if not api_key:
         raise TranscriptionError("GROQ_API_KEY is not set")
 
@@ -89,7 +91,9 @@ async def transcribe_with_groq(audio_path: str) -> str:
 
 async def transcribe_with_wit(audio_path: str) -> str:
     """Fallback transcription via Wit.ai dictation API."""
-    token = os.getenv("WIT_AI_TOKEN")
+    from bot.config import settings
+
+    token = settings.wit_ai_token
     if not token:
         raise TranscriptionError("WIT_AI_TOKEN is not set")
 

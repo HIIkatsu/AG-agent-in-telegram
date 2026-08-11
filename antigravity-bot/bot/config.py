@@ -12,6 +12,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     # GitHub
     github_token: str | None = None
+    groq_api_key: str | None = None
+    wit_ai_token: str | None = None
     
     # Xiaomi Cloud
     xiaomi_user: str | None = None
