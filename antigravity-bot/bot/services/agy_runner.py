@@ -8,13 +8,12 @@ import logging
 import os
 import signal
 import tempfile
-from functools import lru_cache
-from pathlib import Path
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
 
 from aiogram import Bot
 
 from bot.config import settings
+from bot.services.instructions import InstructionBundle, get_instruction_bundle
 from bot.services.permissions import permission_handler
 from bot.services.tracker import TaskTracker
 from bot.utils.sanitizer import IncrementalStreamDecoder
@@ -35,9 +34,9 @@ async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
     except TimeoutError:
         logger.error("agy process %s could not be reaped after SIGKILL", proc.pid)
 
-# System rules written to .agents/AGENTS.md in workdir — CLI reads this
-# as workspace-scoped rules natively, without polluting conversation history.
-_AGENTS_MD_CONTENT = """\
+# Runtime-only rules. These are included in the CLI request and are never written
+# into a mounted project's .agents directory.
+_BASE_RUNTIME_RULES = """\
 # Antigravity Bot — Workspace Rules
 
 ## Language
@@ -74,53 +73,49 @@ _WEB_SEARCH_OFF_RULE = """
 """
 
 
-@lru_cache(maxsize=1)
-def _instructions_content() -> str:
-    instructions_file = Path(__file__).resolve().parent.parent.parent / "INSTRUCTIONS.md"
-    try:
-        return instructions_file.read_text(encoding="utf-8") if instructions_file.exists() else ""
-    except OSError as exc:
-        logger.warning("Failed to read INSTRUCTIONS.md: %s", exc)
-        return ""
-
-
-def _ensure_agents_md(workspace_dir: str, mode: str = "code", web_search: str = "off") -> None:
-    """Write/update .agents/AGENTS.md in workspace so CLI reads rules natively."""
-    agents_dir = Path(workspace_dir) / ".agents"
-    agents_dir.mkdir(exist_ok=True)
-    rules_path = agents_dir / "AGENTS.md"
-    skills_path = agents_dir / "skills.json"
-    
+def _build_runtime_prompt(
+    prompt: str,
+    *,
+    mode: str,
+    web_search: str,
+    execution_profile: str,
+    bundle: InstructionBundle | None = None,
+) -> tuple[str, str]:
+    """Build a runtime-only prompt and return its instruction SHA-256."""
     from bot.modes import get_mode_config
-    cfg = get_mode_config(mode)
-    
-    content = _AGENTS_MD_CONTENT
-    content += f"\n## Mode: {cfg['name']}\n- {cfg['prompt']}\n"
-    
-    if web_search in {"on", "required"}:
-        content += _WEB_SEARCH_RULE
-    else:
-        content += _WEB_SEARCH_OFF_RULE
-        
-    # Inject INSTRUCTIONS.md if it exists
-    bot_root = Path(__file__).resolve().parent.parent.parent
-    instructions = _instructions_content()
-    if instructions:
-        content += "\n" + instructions + "\n"
 
+    cfg = get_mode_config(mode)
+    resolved = bundle or get_instruction_bundle()
+
+    rules = _BASE_RUNTIME_RULES
+    rules += f"\n## Mode: {cfg['name']}\n- {cfg['prompt']}\n"
+    if web_search in {"on", "required"}:
+        rules += _WEB_SEARCH_RULE
+    else:
+        rules += _WEB_SEARCH_OFF_RULE
+    if execution_profile == "chat":
+        rules += "\n## Chat profile\n- Не используй инструменты, если достаточно текстового ответа.\n"
+    if resolved.content:
+        rules += "\n## User policy and private context\n" + resolved.content + "\n"
+
+    return f"{rules}\n## User request\n{prompt}", resolved.sha256
+
+
+async def _log_instruction_hash(tracker: TaskTracker | None, instructions_sha256: str) -> None:
+    """Persist the instruction snapshot hash in the task event log when available."""
+    if not tracker or not tracker.task_id:
+        return
     try:
-        # Only rewrite if content changed (avoid unnecessary disk writes)
-        if not rules_path.exists() or rules_path.read_text(encoding="utf-8") != content:
-            rules_path.write_text(content, encoding="utf-8")
-            
-        # Write skills.json pointing to global skills folder
-        global_skills = bot_root / ".agents" / "skills"
-        skills_content = json.dumps({"inherits": [{"path": str(global_skills)}]}, indent=2)
-        if not skills_path.exists() or skills_path.read_text(encoding="utf-8") != skills_content:
-            skills_path.write_text(skills_content, encoding="utf-8")
-            
-    except OSError as exc:
-        logger.warning("Failed to write AGENTS.md or skills.json: %s", exc)
+        from bot.services.task_service import log_task_event
+
+        await log_task_event(
+            tracker.task_id,
+            "config",
+            f"Instructions SHA-256: {instructions_sha256}",
+            instructions_sha256,
+        )
+    except Exception:
+        logger.exception("Failed to persist instructions SHA-256 for task %s", tracker.task_id)
 
 
 async def run_agy(
@@ -145,16 +140,13 @@ async def run_agy(
     else:
         execution_dir = workspace_dir
         os.makedirs(execution_dir, exist_ok=True)
-        await asyncio.to_thread(_ensure_agents_md, workspace_dir, mode, web_search)
 
-    # CLEAN prompt — no [SYSTEM:] injection. Rules come from .agents/AGENTS.md
-    full_prompt = prompt
-    if is_chat:
-        web_rule = _WEB_SEARCH_RULE if web_search in {"on", "required"} else _WEB_SEARCH_OFF_RULE
-        full_prompt = (
-            "Ответь на русском языке прямо и кратко. Не используй инструменты и не читай "
-            "файлы, если пользователь явно этого не просил.\n" + web_rule + "\n" + prompt
-        )
+    full_prompt, instructions_sha256 = _build_runtime_prompt(
+        prompt,
+        mode=mode,
+        web_search=web_search,
+        execution_profile=execution_profile,
+    )
 
     cmd = [
         settings.agy_path,
@@ -176,7 +168,13 @@ async def run_agy(
     if model:
         cmd.extend(["--model", model])
 
-    logger.info("agy start: conv=%s model='%s'", conversation_id, model or "default")
+    logger.info(
+        "agy start: conv=%s model='%s' instructions_sha256=%s",
+        conversation_id,
+        model or "default",
+        instructions_sha256,
+    )
+    await _log_instruction_hash(tracker, instructions_sha256)
 
     project_id_str = ""
     if thread_id is not None:
@@ -331,8 +329,8 @@ async def run_agy(
                         if proc.stdin and not proc.stdin.is_closing():
                             try:
                                 proc.stdin.close()
-                            except Exception:
-                                pass
+                            except (AttributeError, RuntimeError) as exc:
+                                logger.debug("Unable to close agy stdin cleanly: %s", exc)
                         break
 
             # Flush decoder remainder strictly after while loop

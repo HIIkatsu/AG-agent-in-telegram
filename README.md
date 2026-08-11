@@ -8,7 +8,7 @@ Telegram bot integration for **Antigravity CLI** agent execution, featuring mult
 - 💬 **Forum Topics & Thread Isolation**: Each Telegram thread maps to an isolated workspace with project session persistence.
 - 🎤 **Voice Support**: Instant voice message transcription via cloud STT (Groq with Wit.ai fallback).
 - 🔄 **Git Checkpoints & Rollback**: Automatic workspace checkpoints before tasks with side-by-side diff viewing and one-click rollback.
-- 🛡️ **Native Rules**: Uses `.agents/AGENTS.md` rules for agent behavior control.
+- 🛡️ **Runtime Rules**: Combines tracked `INSTRUCTIONS.md` policy with optional private `INSTRUCTIONS.local.md` context without modifying mounted projects.
 
 ## Project Structure
 
@@ -22,6 +22,8 @@ Telegram bot integration for **Antigravity CLI** agent execution, featuring mult
 │   │   ├── config.py       # Configuration settings
 │   │   └── db.py           # SQLite session management
 │   ├── .env.example
+│   ├── INSTRUCTIONS.md
+│   ├── INSTRUCTIONS.local.example.md
 │   └── requirements.txt
 └── README.md
 ```
@@ -29,7 +31,8 @@ Telegram bot integration for **Antigravity CLI** agent execution, featuring mult
 ## Setup
 
 1. Copy `.env.example` to `.env` and fill in your Telegram Bot credentials.
-2. Install dependencies: `pip install -r antigravity-bot/requirements.txt`.
+2. Optionally copy `antigravity-bot/INSTRUCTIONS.local.example.md` to `antigravity-bot/INSTRUCTIONS.local.md` and add private personal or infrastructure context. The local file is ignored by Git; never put secrets in it. Restart the bot after changing it so a new instruction snapshot and SHA-256 are loaded.
+3. Install dependencies: `pip install -r antigravity-bot/requirements.txt`.
 
 ## IDE Workflow Commands
 

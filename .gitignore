@@ -5,6 +5,7 @@
 *.key
 *.db
 *.sqlite3
+/antigravity-bot/INSTRUCTIONS.local.md
 
 # Python & Runtime
 __pycache__/
@@ -16,7 +17,7 @@ env/
 
 # Temporary / Diagnostic scripts
 _check_server.py
-test_*.py
+/test_*.py
 test.html
 test.js
 test2.js
