@@ -50,6 +50,27 @@ def check_startup() -> None:
         else:
             logger.info("agy found in PATH")
             
+    # Register bundled skills in AGY's user-level global skill directory.
+    # This deliberately never writes into a mounted project's .agents folder.
+    from pathlib import Path
+
+    from bot.services.skill_registry import SkillRegistryError, ensure_global_skills
+
+    try:
+        skill_report = ensure_global_skills(
+            target_dir=Path(settings.agy_global_skills_dir),
+        )
+    except SkillRegistryError as exc:
+        logger.error("Cannot register bundled AGY skills: %s", exc)
+        sys.exit(1)
+    logger.info(
+        "Bundled AGY skills ready: available=%d installed=%d updated=%d removed=%d",
+        skill_report.available_count,
+        len(skill_report.installed),
+        len(skill_report.updated),
+        len(skill_report.removed),
+    )
+
     # Check workspaces dir
     try:
         os.makedirs(settings.workspaces_dir, exist_ok=True)
@@ -111,17 +132,17 @@ async def main() -> None:
     await _set_commands(bot)
 
     # Import and include routers (order matters!)
-    from bot.handlers.start import router as start_router
+    from bot.handlers.callbacks import router as callbacks_router
     from bot.handlers.chats import router as chats_router
     from bot.handlers.dashboard import router as dashboard_router
-    from bot.handlers.settings import router as settings_router
+    from bot.handlers.environments import router as environments_router
     from bot.handlers.files import router as files_router
     from bot.handlers.git_ui import router as git_router
     from bot.handlers.ide import router as ide_router
-    from bot.handlers.callbacks import router as callbacks_router
     from bot.handlers.memory import router as memory_router
     from bot.handlers.message import router as message_router
-    from bot.handlers.environments import router as environments_router
+    from bot.handlers.settings import router as settings_router
+    from bot.handlers.start import router as start_router
 
     dp.include_router(start_router)
     dp.include_router(chats_router)

@@ -178,17 +178,13 @@ class Database:
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.executescript(_CREATE_TABLES)
-        
-        # Auto-migrate running tasks to interrupted on bot startup
-        await self._conn.execute(
-            "UPDATE tasks SET status = 'interrupted' WHERE status = 'running'"
-        )
-        
         await self._conn.commit()
 
     async def close(self) -> None:
-        if self._conn:
-            await self._conn.close()
+        connection = self._conn
+        self._conn = None
+        if connection:
+            await connection.close()
 
     # ------------------------------------------------------------------
     # session CRUD
