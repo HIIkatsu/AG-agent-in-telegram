@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     allowed_user_ids: str  # comma-separated
     forum_group_id: int = 0  # Telegram chat ID of the forum group
     agy_path: str = "/root/.local/bin/agy"
+    agy_global_skills_dir: str = "~/.gemini/antigravity-cli/skills"
     workspaces_dir: str = "/tmp/workspaces"
     db_path: str = "/opt/antigravity-bot/data/bot.db"
     log_level: str = "INFO"

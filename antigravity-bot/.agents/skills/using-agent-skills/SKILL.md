@@ -16,6 +16,8 @@ When a task arrives, identify the development phase and apply the corresponding 
 ```
 Task arrives
     │
+    ├── Remember/list/forget a user fact? ──→ global-memory
+    ├── Operate a configured remote host? ──→ remote-environments
     ├── Don't know what you want yet? ──────→ interview-me
     ├── Have a rough concept, need variants? → idea-refine
     ├── New project/feature/change? ──→ spec-driven-development
@@ -168,6 +170,8 @@ Not every task needs every skill. A bug fix might only need: `debugging-and-erro
 |-------|-------|-----------------|
 | Define | interview-me | Surface what the user actually wants before any plan, spec, or code exists |
 | Define | idea-refine | Refine ideas through structured divergent and convergent thinking |
+| Operate | global-memory | Manage durable user facts shared by every Telegram project |
+| Operate | remote-environments | Broker explicitly requested work on configured SSH hosts |
 | Define | spec-driven-development | Requirements and acceptance criteria before code |
 | Plan | planning-and-task-breakdown | Decompose into small, verifiable tasks |
 | Build | incremental-implementation | Thin vertical slices, test each before expanding |
