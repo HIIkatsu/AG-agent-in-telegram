@@ -2,9 +2,9 @@
 
 MODES = {
     "chat": {
-        "name": "Chat", 
-        "prompt": "General assistant. Help the user with their questions. Provide concise and accurate answers.", 
-        "web": "auto"
+        "name": "⚡ Chat",
+        "prompt": "General assistant. Answer directly and do not use tools when a text answer is sufficient.",
+        "web": "off"
     },
     "plan": {
         "name": "Plan", 
@@ -12,7 +12,7 @@ MODES = {
         "web": "off"
     },
     "code": {
-        "name": "Code", 
+        "name": "🛠 Code task",
         "prompt": "Write modular, clean code with strict typing. You are an expert software engineer.", 
         "web": "off"
     }

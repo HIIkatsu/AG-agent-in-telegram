@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -52,6 +53,11 @@ _WEB_SEARCH_RULE = """
   через bash/curl перед формулированием ответа.
 """
 
+_WEB_SEARCH_AUTO_RULE = """
+## Web Search
+- Используй веб-поиск только если запрос требует актуальных или проверяемых данных.
+"""
+
 
 def _ensure_agents_md(workspace_dir: str, mode: str = "code", web_search: str = "off") -> None:
     """Write/update .agents/AGENTS.md in workspace so CLI reads rules natively."""
@@ -66,8 +72,10 @@ def _ensure_agents_md(workspace_dir: str, mode: str = "code", web_search: str = 
     content = _AGENTS_MD_CONTENT
     content += f"\n## Mode: {cfg['name']}\n- {cfg['prompt']}\n"
     
-    if web_search in ("auto", "required"):
+    if web_search == "required":
         content += _WEB_SEARCH_RULE
+    elif web_search == "auto":
+        content += _WEB_SEARCH_AUTO_RULE
         
     # Inject INSTRUCTIONS.md if it exists
     bot_root = Path(__file__).resolve().parent.parent.parent
@@ -104,24 +112,37 @@ async def run_agy(
     web_search: str = "off",
     model: str = "",
     mode: str = "code",
+    execution_profile: str = "code",
     thread_id: int | None = None,
 ) -> str:
     """Execute agy CLI process with 5-minute timeout, STDIN permissions, backups, error capture, and Russian language enforcement."""
-    os.makedirs(workspace_dir, exist_ok=True)
-    _ensure_agents_md(workspace_dir, mode=mode, web_search=web_search)
+    is_chat = execution_profile == "chat"
+    if is_chat:
+        execution_dir = os.path.join(tempfile.gettempdir(), "antigravity-chat", conversation_id)
+        os.makedirs(execution_dir, exist_ok=True)
+    else:
+        execution_dir = workspace_dir
+        os.makedirs(execution_dir, exist_ok=True)
+        await asyncio.to_thread(_ensure_agents_md, workspace_dir, mode, web_search)
 
     # CLEAN prompt — no [SYSTEM:] injection. Rules come from .agents/AGENTS.md
     full_prompt = prompt
+    if is_chat:
+        full_prompt = (
+            "Ответь на русском языке прямо и кратко. Не используй инструменты и не читай "
+            "файлы, если пользователь явно этого не просил.\n\n" + prompt
+        )
 
     cmd = [
         settings.agy_path,
         "--print", full_prompt,
         "--project", conversation_id,
         "--continue",
-        "--add-dir", workspace_dir,
         "--output-format", "stream-json",
         "--print-timeout", settings.agy_print_timeout,
     ]
+    if not is_chat:
+        cmd.extend(["--add-dir", workspace_dir])
 
     if settings.dangerously_skip_permissions:
         cmd.append("--dangerously-skip-permissions")
@@ -155,7 +176,7 @@ async def run_agy(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=workspace_dir,
+        cwd=execution_dir,
         env=env,
     )
 
