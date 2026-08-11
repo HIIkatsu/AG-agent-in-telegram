@@ -262,6 +262,15 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 typing_task.cancel()
                 _active_tasks.pop(thread_id, None)
 
+            # Finalize the visible answer before any artifact scanning/diff work so the
+            # user does not wait on slower post-processing after the model is done.
+            try:
+                tracker.has_changes_after_finish = await git_manager.has_changes_async(ws, timeout=5)
+            except Exception:
+                tracker.has_changes_after_finish = False
+
+            await tracker.finish("TIMEOUT" if task_status == "timeout" else "ERROR" if task_status == "failed" else "CANCELLED" if task_status == "cancelled" else "DONE")
+
             # Artifact post-tool processing: git changed files + bounded scratchpad scan.
             new_files = await collect_task_artifacts(ws, artifacts_started_at)
 
@@ -277,13 +286,6 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                         synced_files.append(fpath)
                 else:
                     synced_files.append(fpath)
-
-            try:
-                tracker.has_changes_after_finish = await git_manager.has_changes_async(ws, timeout=5)
-            except Exception:
-                tracker.has_changes_after_finish = False
-
-            await tracker.finish("TIMEOUT" if task_status == "timeout" else "ERROR" if task_status == "failed" else "CANCELLED" if task_status == "cancelled" else "DONE")
 
             if synced_files:
                 from bot.services.tracker import rollback_registry
