@@ -7,8 +7,15 @@ from bot.services.execution_profiles import (
 )
 
 
-def test_chat_memory_budget_keeps_substantial_context() -> None:
-    assert CHAT_MEMORY_CHAR_BUDGET >= 8_000
+def test_web_policy_is_strictly_binary_and_supports_legacy_required():
+    assert effective_web_policy("off", "on") == "off"
+    assert effective_web_policy("auto", "on") == "off"
+    assert effective_web_policy("on", "off") == "on"
+    assert effective_web_policy("required", "off") == "on"
+
+
+def test_chat_memory_budget_stays_lightweight() -> None:
+    assert 1_500 <= CHAT_MEMORY_CHAR_BUDGET <= 2_500
 
 
 def test_plain_question_uses_fast_chat() -> None:
@@ -27,8 +34,9 @@ def test_code_request_overrides_chat_mode() -> None:
 
 
 def test_effective_web_policy_honours_explicit_setting_and_default() -> None:
-    assert effective_web_policy("required", "off") == "required"
-    assert effective_web_policy("", "auto") == "auto"
+    assert effective_web_policy("required", "off") == "on"
+    assert effective_web_policy("", "on") == "on"
+    assert effective_web_policy("", "auto") == "off"
     assert effective_web_policy(None, "invalid") == "off"
 
 

@@ -11,7 +11,7 @@ ExecutionProfile = Literal["chat", "code"]
 # Conversation continuity itself is retained by ``agy --continue``. This budget is
 # for supplemental project memory: large enough for a useful set of recent/relevant
 # notes, but still independent from heavyweight pinned file context.
-CHAT_MEMORY_CHAR_BUDGET = 8_000
+CHAT_MEMORY_CHAR_BUDGET = 2_000
 CODE_MEMORY_CHAR_BUDGET = 8_000
 
 _CODE_INTENT_RE = re.compile(
@@ -43,11 +43,13 @@ def effective_mode(session_mode: str, profile: ExecutionProfile) -> str:
 
 
 def effective_web_policy(session_policy: str | None, mode_default: str) -> str:
-    """Resolve the explicit session preference against the selected mode default."""
+    """Return the binary web policy, accepting legacy enabled values."""
     policy = (session_policy or "").strip().lower()
-    if policy in {"off", "auto", "required"}:
-        return policy
-    return mode_default if mode_default in {"off", "auto", "required"} else "off"
+    if policy in {"on", "required"}:
+        return "on"
+    if policy in {"off", "auto"}:
+        return "off"
+    return "on" if mode_default in {"on", "required"} else "off"
 
 
 def select_relevant_notes(

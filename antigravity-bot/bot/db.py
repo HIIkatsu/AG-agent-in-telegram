@@ -301,8 +301,9 @@ class Database:
         await self._conn.commit()
 
     async def set_web_search(self, thread_id: int, web_search: str) -> None:
-        """Set web_search mode ('off', 'auto', 'required')."""
+        """Set the binary web-search mode; ``required`` is a legacy alias for on."""
         assert self._conn
+        web_search = "on" if web_search in {"on", "required"} else "off"
         await self._conn.execute(
             "UPDATE thread_sessions SET web_search = ? WHERE thread_id = ?",
             (web_search, thread_id),
@@ -310,14 +311,10 @@ class Database:
         await self._conn.commit()
 
     async def toggle_web_search(self, thread_id: int) -> str:
-        """Cycle web_search mode: off -> auto -> required -> off."""
+        """Toggle web search between off and on."""
         session = await self.get_or_create_session(thread_id)
         current = session.get("web_search", "off")
-        modes = ("off", "auto", "required")
-        try:
-            next_mode = modes[(modes.index(current) + 1) % len(modes)]
-        except ValueError:
-            next_mode = "off"
+        next_mode = "off" if current in {"on", "required"} else "on"
         await self.set_web_search(thread_id, next_mode)
         return next_mode
 

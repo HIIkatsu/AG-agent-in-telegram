@@ -138,6 +138,10 @@ async def cmd_cancel(message: Message) -> None:
         await tracker.cancel()
         if agy_task and not agy_task.done():
             agy_task.cancel()
+            try:
+                await agy_task
+            except asyncio.CancelledError:
+                pass
     await cancel_queue(thread_id)
     await message.answer("⏹ Текущая задача и очередь отменены.")
 

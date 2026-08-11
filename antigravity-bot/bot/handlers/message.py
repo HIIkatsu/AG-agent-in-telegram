@@ -296,7 +296,11 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
 
             await tracker.finish("TIMEOUT" if task_status == "timeout" else "ERROR" if task_status == "failed" else "CANCELLED" if task_status == "cancelled" else "DONE")
 
-            if execution_profile == "chat" or task_status == "cancelled":
+            if (
+                execution_profile == "chat"
+                or task_status in {"cancelled", "failed"}
+                or (task_status == "timeout" and not tracker.has_changes_after_finish)
+            ):
                 await asyncio.sleep(0.5)
                 continue
 

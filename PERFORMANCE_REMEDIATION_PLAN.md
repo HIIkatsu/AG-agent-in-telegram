@@ -457,6 +457,9 @@ mem = "\n".join(f"- {row['note']}" for row in memory_notes[:20])
 
 ### 2.5. Не подмешивать pinned context files в обычный chat prompt без необходимости
 
+**Статус: выполнено.** Pinned paths добавляются только в code profile; fast chat
+получает лишь релевантную память в пределах отдельного бюджета.
+
 Файл: `bot/handlers/message.py`
 
 ```python
@@ -474,6 +477,9 @@ mem = "\n".join(f"- {row['note']}" for row in memory_notes[:20])
 4. В AGENTS rules для chat-mode добавить запрет читать файлы без явного запроса.
 
 ### 2.6. Закешировать AGENTS.md content и вынести запись правил из горячего пути
+
+**Статус: выполнено.** INSTRUCTIONS.md кешируется, запись правил выполняется через
+`asyncio.to_thread` и только при изменении содержимого; chat profile не пишет workspace rules.
 
 Файл: `bot/services/agy_runner.py`
 
@@ -496,6 +502,9 @@ mem = "\n".join(f"- {row['note']}" for row in memory_notes[:20])
 
 ### 2.7. Не сохранять большие code blocks в workspace автоматически
 
+**Статус: выполнено.** Длинные snippets создаются во временной директории, отправляются
+как Telegram documents и удаляются после отправки.
+
 Файл: `bot/services/tracker.py`
 
 Если агент просто прислал длинный code block, tracker создаёт `snippet_1.py` в workspace. Это:
@@ -516,6 +525,9 @@ mem = "\n".join(f"- {row['note']}" for row in memory_notes[:20])
 5. Если пользователь явно просил создать файл — это должен делать agent/tool pipeline, не renderer.
 
 ### 2.8. Сделать корректную отмену agy_task с ожиданием завершения subprocess
+
+**Статус: выполнено.** Callback и `/cancel` ожидают отменённую задачу, а runner убивает
+и дожидается subprocess перед пробросом `CancelledError`.
 
 Файлы:
 
@@ -540,6 +552,9 @@ await cancel_queue(thread_id)
 5. После отмены не запускать artifact scan/diff generation для cancelled task.
 
 ### 2.9. Пропускать тяжёлую post-processing фазу для cancelled/timeout/failed без изменений
+
+**Статус: выполнено.** Chat, cancelled и failed задачи не запускают artifact scan;
+финальный ответ отображается до post-processing, а diff остаётся ленивой кнопкой.
 
 Файл: `bot/handlers/message.py:_process_queue`
 
