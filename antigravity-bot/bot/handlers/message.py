@@ -7,10 +7,12 @@ General topic (thread_id=None) ignores regular prompts.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import tempfile
 import urllib.parse
+from dataclasses import dataclass, field
 
 from aiogram import Bot, F, Router
 from aiogram.types import Message
@@ -34,7 +36,27 @@ from bot.services.voice import transcribe_voice
 
 router = Router(name="message")
 
+logger = logging.getLogger(__name__)
+
 _queue_loops: set[int] = set()
+
+_MEDIA_GROUP_DEBOUNCE_SECONDS = 0.8
+
+
+@dataclass
+class _MediaGroup:
+    """Files received for one Telegram album while its debounce timer runs."""
+
+    message: Message
+    bot: Bot
+    attachments: list[str] = field(default_factory=list)
+    captions: list[str] = field(default_factory=list)
+    timer: asyncio.Task[None] | None = None
+
+
+# Include the chat in the key because Telegram only guarantees a media group ID
+# within the context in which the album was sent.
+_media_groups: dict[tuple[int, str], _MediaGroup] = {}
 
 _VOICE_FRAMES = ["🎙 ⠋ Распознаю...", "🎙 ⠙ Распознаю...", "🎙 ⠹ Распознаю...", "🎙 ⠸ Распознаю..."]
 
@@ -47,6 +69,60 @@ def _normalize_filename(name: str) -> str:
         return "uploaded_file"
     stem, ext = os.path.splitext(name)
     return f"{stem[:80]}{ext[:16]}"
+
+
+async def _flush_media_group(key: tuple[int, str]) -> None:
+    """Wait for an album to settle, then enqueue it as one model task."""
+    try:
+        await asyncio.sleep(_MEDIA_GROUP_DEBOUNCE_SECONDS)
+        group = _media_groups.pop(key, None)
+        if group is None:
+            return
+
+        caption = next((value for value in group.captions if value.strip()), "")
+        if not caption:
+            caption = (
+                f"Пользователь отправил альбом из {len(group.attachments)} вложений. "
+                "Проанализируй все вложения вместе."
+            )
+        await _process(
+            group.message,
+            caption,
+            group.bot,
+            files=group.attachments,
+        )
+    except asyncio.CancelledError:
+        # A new album item resets the quiet-period timer.
+        return
+    except Exception:
+        # Background task exceptions otherwise have no handler to report them.
+        logger.exception("Failed to flush Telegram media group %s", key[1])
+
+
+def _buffer_media_group(
+    message: Message,
+    bot: Bot,
+    attachment: str,
+    caption: str | None,
+) -> bool:
+    """Buffer an album item and return whether immediate processing was deferred."""
+    media_group_id = message.media_group_id
+    if not media_group_id:
+        return False
+
+    key = (message.chat.id, media_group_id)
+    group = _media_groups.get(key)
+    if group is None:
+        group = _MediaGroup(message=message, bot=bot)
+        _media_groups[key] = group
+    elif group.timer is not None:
+        group.timer.cancel()
+
+    group.attachments.append(attachment)
+    if caption:
+        group.captions.append(caption)
+    group.timer = asyncio.create_task(_flush_media_group(key))
+    return True
 
 
 @router.message(F.forum_topic_created)
@@ -361,6 +437,8 @@ async def on_photo(message: Message, bot: Bot) -> None:
 
     caption = message.caption or "Пользователь отправил фото. Проанализируй его."
     rel_path = f"uploads/{filename}"
+    if _buffer_media_group(message, bot, rel_path, message.caption):
+        return
     prompt = f"{caption}\n\n[Фото сохранено: {rel_path}]"
     await _process(message, prompt, bot, files=[rel_path])
 
@@ -397,6 +475,8 @@ async def on_document(message: Message, bot: Bot) -> None:
 
     caption = message.caption or f"Пользователь отправил файл: {filename}"
     rel_path = f"uploads/{filename}"
+    if _buffer_media_group(message, bot, rel_path, message.caption):
+        return
     prompt = f"{caption}\n\n[Файл сохранен: {rel_path}]"
     await _process(message, prompt, bot, files=[rel_path])
 
