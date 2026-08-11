@@ -368,8 +368,15 @@ class TaskTracker:
         from bot.services.telegram_rate_limiter import telegram_rate_limiter
         if not await telegram_rate_limiter.allow_edit(msg.chat.id, msg.message_id, final=final, force=force):
             return
+        timeout = 12.0 if final or force else 4.0
         try:
-            await msg.edit_text(html_text, parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=True)
+            await asyncio.wait_for(
+                msg.edit_text(html_text, parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=True),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.debug("Telegram edit timed out after %.1fs (final=%s, force=%s)", timeout, final, force)
+            return
         except Exception as exc:
             err = str(exc)
             if "message is not modified" in err:
@@ -382,12 +389,18 @@ class TaskTracker:
                     return
                 await asyncio.sleep(retry_after)
                 try:
-                    await msg.edit_text(html_text, parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=True)
+                    await asyncio.wait_for(
+                        msg.edit_text(html_text, parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=True),
+                        timeout=timeout,
+                    )
                 except Exception:
                     pass
             elif "can't parse entities" in err.lower():
                 try:
-                    await msg.edit_text(strip_telegram_html(html_text), reply_markup=reply_markup)
+                    await asyncio.wait_for(
+                        msg.edit_text(strip_telegram_html(html_text), reply_markup=reply_markup),
+                        timeout=timeout,
+                    )
                 except Exception:
                     pass
 
