@@ -71,6 +71,31 @@ def check_startup() -> None:
         len(skill_report.removed),
     )
 
+    # Register the bot-owned native memory tools in AGY's global MCP config.
+    # The merger preserves unrelated MCP servers and refuses to overwrite a
+    # conflicting server with the same name.
+    from bot.services.instructions import BOT_ROOT
+    from bot.services.memory_mcp_config import (
+        MemoryMcpConfigError,
+        ensure_memory_mcp_config,
+    )
+
+    try:
+        memory_mcp_report = ensure_memory_mcp_config(
+            config_path=Path(settings.agy_mcp_config_path),
+            python_executable=Path(sys.executable),
+            bot_root=BOT_ROOT,
+            db_path=settings.db_path,
+        )
+    except MemoryMcpConfigError as exc:
+        logger.error("Cannot configure AGY native memory tools: %s", exc)
+        sys.exit(1)
+    logger.info(
+        "AGY native memory tools ready: state=%s config=%s",
+        memory_mcp_report.state,
+        memory_mcp_report.config_path,
+    )
+
     # Check source and isolated task workspace roots.
     for workspace_root in (settings.workspaces_dir, settings.task_workspaces_dir):
         try:
@@ -87,7 +112,7 @@ async def _set_commands(bot: Bot) -> None:
         BotCommand(command="files", description="Файловый менеджер проекта"),
         BotCommand(command="search", description="Поиск по проекту"),
         BotCommand(command="context", description="Контекст задачи"),
-        BotCommand(command="memory", description="Память проекта"),
+        BotCommand(command="memory", description="Память: проект и глобальная"),
         BotCommand(command="diff", description="Diff workflow"),
         BotCommand(command="test", description="Запустить тесты"),
         BotCommand(command="run", description="Запустить команду"),
@@ -95,7 +120,6 @@ async def _set_commands(bot: Bot) -> None:
         BotCommand(command="status", description="Статус задачи"),
         BotCommand(command="cancel", description="Отменить текущую задачу"),
         BotCommand(command="git", description="История коммитов"),
-        BotCommand(command="memory", description="Глобальная память агента"),
         BotCommand(command="stats", description="Подробная статистика и лимиты"),
         BotCommand(command="settings", description="Глобальные настройки (Мастер-панель)"),
     ]
@@ -108,7 +132,9 @@ async def main() -> None:
     logger.info("Connecting to database ...")
     await db.connect()
 
-    # Purge broken CLI sessions (e.g. old invalid-UUID dirs) at startup
+    # Purge broken CLI sessions (e.g. old invalid-UUID dirs) at startup.
+    # The cleanup is restricted to the CLI's brain directory and never touches
+    # global skills or other AGY state.
     from bot.handlers.chats import purge_stale_cli_sessions
     purged = purge_stale_cli_sessions()
     if purged:
