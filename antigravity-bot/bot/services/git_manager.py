@@ -1,4 +1,4 @@
-"""Local Git Version Control Engine for Workspace Snapshots, Diffs, and Rollback."""
+"""Read-only Git inspection plus explicit initialization of bot-owned projects."""
 
 from __future__ import annotations
 
@@ -14,6 +14,10 @@ logger = logging.getLogger(__name__)
 
 class GitCommandTimeout(RuntimeError):
     """Raised when a git command exceeds its configured timeout."""
+
+
+class GitRepositoryRequired(RuntimeError):
+    """Raised when a read operation is requested for a non-Git directory."""
 
 
 def _run_git(ws_dir: str, *args: str, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
@@ -44,10 +48,18 @@ async def _to_thread(fn: Any, /, *args: Any, wait_timeout: float | None = None, 
 
 
 class GitManager:
-    """Manages local git repo per chat workspace for instant diffs and clean rollbacks."""
+    """Inspect repositories without changing their index, worktree, or refs."""
+
+    def _require_repository(self, ws_dir: str, timeout: float) -> None:
+        result = _run_git(ws_dir, "rev-parse", "--is-inside-work-tree", timeout=timeout)
+        if result.returncode != 0 or result.stdout.strip() != "true":
+            raise GitRepositoryRequired(f"Workspace is not a Git repository: {ws_dir}")
 
     def init_workspace(self, ws_dir: str, timeout: float = 10) -> None:
-        """Initialize git repo in workspace if not already present."""
+        """Initialize an explicitly bot-owned workspace.
+
+        Callers must never use this for an arbitrary mounted directory.
+        """
         os.makedirs(ws_dir, exist_ok=True)
         git_dir = os.path.join(ws_dir, ".git")
         if not os.path.isdir(git_dir):
@@ -56,27 +68,43 @@ class GitManager:
             if not os.path.exists(gitignore_path):
                 with open(gitignore_path, "w", encoding="utf-8") as f:
                     f.write(".agyrules\n.agents/\n__pycache__/\n")
-            _run_git(ws_dir, "init", timeout=timeout)
-            _run_git(ws_dir, "config", "user.name", "AntigravityBot", timeout=timeout)
-            _run_git(ws_dir, "config", "user.email", "bot@antigravity.local", timeout=timeout)
-            _run_git(ws_dir, "add", ".", timeout=timeout)
-            _run_git(ws_dir, "commit", "-m", "Initial commit", "--allow-empty", timeout=timeout)
+            commands = (
+                ("init",),
+                ("config", "user.name", "AntigravityBot"),
+                ("config", "user.email", "bot@antigravity.local"),
+                ("add", "."),
+                ("commit", "-m", "Initial commit", "--allow-empty"),
+            )
+            for command in commands:
+                result = _run_git(ws_dir, *command, timeout=timeout)
+                if result.returncode != 0:
+                    detail = result.stderr.strip() or result.stdout.strip()
+                    raise RuntimeError(f"git {' '.join(command)} failed: {detail}")
 
     async def init_workspace_async(self, ws_dir: str, timeout: float = 10) -> None:
         await _to_thread(self.init_workspace, ws_dir, timeout=timeout, wait_timeout=timeout)
 
     def get_current_branch(self, ws_dir: str, timeout: float = 5) -> str:
-        self.init_workspace(ws_dir, timeout=timeout)
+        self._require_repository(ws_dir, timeout)
         res = _run_git(ws_dir, "rev-parse", "--abbrev-ref", "HEAD", timeout=timeout)
+        if res.returncode != 0:
+            raise GitRepositoryRequired(res.stderr.strip() or "Git HEAD is unavailable")
         return res.stdout.strip()
 
     async def get_current_branch_async(self, ws_dir: str, timeout: float = 5) -> str:
         return await _to_thread(self.get_current_branch, ws_dir, timeout=timeout, wait_timeout=timeout)
 
     def status(self, ws_dir: str, timeout: float = 5) -> list[str]:
-        self.init_workspace(ws_dir, timeout=timeout)
-        _run_git(ws_dir, "add", "-N", ".", timeout=timeout)
-        res = _run_git(ws_dir, "status", "--porcelain", timeout=timeout)
+        self._require_repository(ws_dir, timeout)
+        res = _run_git(
+            ws_dir,
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            timeout=timeout,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.strip() or "git status failed")
         return [line for line in res.stdout.splitlines() if line.strip()]
 
     async def status_async(self, ws_dir: str, timeout: float = 5) -> list[str]:
@@ -95,25 +123,6 @@ class GitManager:
     async def changed_files_async(self, ws_dir: str, timeout: float = 5) -> list[str]:
         return await _to_thread(self.changed_files, ws_dir, timeout=timeout, wait_timeout=timeout)
 
-    def create_checkpoint(self, ws_dir: str, label: str = "checkpoint", timeout: float = 15) -> str:
-        self.init_workspace(ws_dir, timeout=timeout)
-        gitignore_path = os.path.join(ws_dir, ".gitignore")
-        _needed = {".agyrules", ".agents/"}
-        if os.path.exists(gitignore_path):
-            existing = set(open(gitignore_path, encoding="utf-8").read().splitlines())
-            missing = _needed - existing
-            if missing:
-                with open(gitignore_path, "a", encoding="utf-8") as f:
-                    for m in missing:
-                        f.write(f"\n{m}")
-        _run_git(ws_dir, "add", ".", timeout=timeout)
-        _run_git(ws_dir, "commit", "-m", f"Pre-task: {label}", "--allow-empty", timeout=timeout)
-        res = _run_git(ws_dir, "rev-parse", "HEAD", timeout=timeout)
-        return res.stdout.strip()
-
-    async def create_checkpoint_async(self, ws_dir: str, label: str = "checkpoint", timeout: float = 15) -> str:
-        return await _to_thread(self.create_checkpoint, ws_dir, label, timeout=timeout, wait_timeout=timeout)
-
     def has_changes(self, ws_dir: str, timeout: float = 5) -> bool:
         return bool(self.status(ws_dir, timeout=timeout))
 
@@ -121,41 +130,35 @@ class GitManager:
         return await _to_thread(self.has_changes, ws_dir, timeout=timeout, wait_timeout=timeout)
 
     def get_diff(self, ws_dir: str, timeout: float = 5) -> str:
-        self.init_workspace(ws_dir, timeout=timeout)
-        _run_git(ws_dir, "add", "-N", ".", timeout=timeout)
-        res = _run_git(ws_dir, "diff", "HEAD", timeout=timeout)
-        return res.stdout
+        self._require_repository(ws_dir, timeout)
+        res = _run_git(
+            ws_dir,
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+            timeout=timeout,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.strip() or "git diff failed")
+        untracked = _run_git(
+            ws_dir,
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            timeout=timeout,
+        )
+        if untracked.returncode != 0:
+            raise RuntimeError(untracked.stderr.strip() or "git ls-files failed")
+        names = [name for name in untracked.stdout.splitlines() if name]
+        if not names:
+            return res.stdout
+        summary = "\n".join(f"# untracked: {name}" for name in names)
+        return f"{res.stdout}\n{summary}\n"
 
     async def get_diff_async(self, ws_dir: str, timeout: float = 5) -> str:
         return await _to_thread(self.get_diff, ws_dir, timeout=timeout, wait_timeout=timeout)
-
-    def rollback(self, ws_dir: str, timeout: float = 15) -> bool:
-        self.init_workspace(ws_dir, timeout=timeout)
-        res_reset = _run_git(ws_dir, "reset", "--hard", "HEAD", timeout=timeout)
-        res_clean = _run_git(ws_dir, "clean", "-fd", timeout=timeout)
-        logger.info("Git rollback in %s: reset=%s, clean=%s", ws_dir, res_reset.stdout.strip(), res_clean.stdout.strip())
-        return res_reset.returncode == 0
-
-    async def rollback_async(self, ws_dir: str, timeout: float = 15) -> bool:
-        return await _to_thread(self.rollback, ws_dir, timeout=timeout, wait_timeout=timeout)
-
-    def rollback_to_commit(self, ws_dir: str, commit_hash: str, timeout: float = 15) -> bool:
-        self.init_workspace(ws_dir, timeout=timeout)
-        res_reset = _run_git(ws_dir, "reset", "--hard", commit_hash, timeout=timeout)
-        res_clean = _run_git(ws_dir, "clean", "-fd", timeout=timeout)
-        logger.info("Git rollback to %s in %s: reset=%s, clean=%s", commit_hash, ws_dir, res_reset.stdout.strip(), res_clean.stdout.strip())
-        return res_reset.returncode == 0
-
-    async def rollback_to_commit_async(self, ws_dir: str, commit_hash: str, timeout: float = 15) -> bool:
-        return await _to_thread(self.rollback_to_commit, ws_dir, commit_hash, timeout=timeout, wait_timeout=timeout)
-
-    def accept(self, ws_dir: str, timeout: float = 15) -> None:
-        self.init_workspace(ws_dir, timeout=timeout)
-        _run_git(ws_dir, "add", ".", timeout=timeout)
-        _run_git(ws_dir, "commit", "-m", "Accepted task modifications", "--allow-empty", timeout=timeout)
-
-    async def accept_async(self, ws_dir: str, timeout: float = 15) -> None:
-        await _to_thread(self.accept, ws_dir, timeout=timeout, wait_timeout=timeout)
-
 
 git_manager = GitManager()

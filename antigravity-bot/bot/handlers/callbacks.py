@@ -3,18 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.config import settings
 from bot.db import db
-from bot.services.agy_runner import run_agy
 from bot.services.diff_viewer import generate_diff_html_file
 from bot.services.git_manager import git_manager
 from bot.services.permissions import permission_handler
+from bot.services.task_workspace import (
+    TaskWorkspaceConflict,
+    TaskWorkspaceError,
+    task_workspace_manager,
+)
 
 router = Router(name="callbacks")
+logger = logging.getLogger(__name__)
+
+
+def _short_error(exc: BaseException, limit: int = 120) -> str:
+    return str(exc).replace("\n", " ")[:limit]
 
 
 async def _resolve_thread_from_callback(last_part: str) -> int | None:
@@ -130,24 +140,45 @@ async def cb_purge_cli_sessions(cq: CallbackQuery, bot: Bot) -> None:
 async def cb_view_diff(cq: CallbackQuery, bot: Bot) -> None:
     assert cq.from_user and cq.message
     parts = cq.data.split(":")  # type: ignore[union-attr]
-    thread_id = await _resolve_thread_from_callback(parts[-1])
-    if thread_id is None:
-        await cq.answer("Не удалось определить ветку", show_alert=True)
-        return
-    session = await db.get_session(thread_id)
-    if not session:
-        await cq.answer("Сессия не найдена", show_alert=True)
-        return
-
-    ws = session["workdir"]
-    raw_diff = await git_manager.get_diff_async(ws)
+    if cq.data.startswith("t:df:"):  # type: ignore[union-attr]
+        try:
+            task_id = int(parts[-1])
+            workspace = await task_workspace_manager.get(task_id)
+            if not workspace:
+                await cq.answer("Изолированный workspace задачи не найден", show_alert=True)
+                return
+            thread_id = workspace.thread_id
+            raw_diff = await task_workspace_manager.diff(task_id)
+            title = f"Task {task_id}"
+        except (ValueError, TaskWorkspaceError) as exc:
+            await cq.answer(
+                f"Не удалось прочитать diff: {_short_error(exc)}", show_alert=True
+            )
+            return
+    else:
+        thread_id = await _resolve_thread_from_callback(parts[-1])
+        if thread_id is None:
+            await cq.answer("Не удалось определить ветку", show_alert=True)
+            return
+        session = await db.get_session(thread_id)
+        if not session:
+            await cq.answer("Сессия не найдена", show_alert=True)
+            return
+        try:
+            raw_diff = await git_manager.get_diff_async(session["workdir"])
+        except Exception as exc:
+            await cq.answer(
+                f"Git diff недоступен: {_short_error(exc)}", show_alert=True
+            )
+            return
+        title = f"Thread {thread_id}"
 
     if not raw_diff or not raw_diff.strip():
         await cq.answer("Нет измененных файлов.", show_alert=True)
         return
 
     await cq.answer("Генерация diff.html...")
-    diff_file_path = generate_diff_html_file(raw_diff, f"Thread {thread_id}")
+    diff_file_path = generate_diff_html_file(raw_diff, title)
     doc = FSInputFile(diff_file_path, filename="diff.html")
     await bot.send_document(
         cq.message.chat.id,
@@ -160,103 +191,96 @@ async def cb_view_diff(cq: CallbackQuery, bot: Bot) -> None:
 
 # ── Git Accept Diff ──────────────────────────────────────────────────────
 
-@router.callback_query(F.data.startswith("t:ac:") | F.data.startswith("accept_diff:"))
-async def cb_accept_diff(cq: CallbackQuery) -> None:
+@router.callback_query(F.data.startswith("t:ac:"))
+async def cb_accept_diff(cq: CallbackQuery, bot: Bot) -> None:
     assert cq.from_user and cq.message
-    parts = cq.data.split(":")  # type: ignore[union-attr]
-    thread_id = await _resolve_thread_from_callback(parts[-1])
-    if thread_id is None:
-        await cq.answer("Не удалось определить ветку", show_alert=True)
+    try:
+        task_id = int(cq.data.split(":")[-1])  # type: ignore[union-attr]
+    except ValueError:
+        await cq.answer("Некорректный ID задачи", show_alert=True)
         return
-    session = await db.get_session(thread_id)
-    if session:
-        ws = session["workdir"]
-        await git_manager.accept_async(ws)
-        await cq.answer("Изменения приняты!")
-        try:
-            await cq.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-    else:
-        await cq.answer("Сессия не найдена", show_alert=True)
+    workspace = await task_workspace_manager.get(task_id)
+    if not workspace:
+        await cq.answer("Изолированный workspace задачи не найден", show_alert=True)
+        return
+    try:
+        changed = await task_workspace_manager.accept(task_id)
+    except TaskWorkspaceConflict as exc:
+        await cq.answer(
+            "Конфликт: исходный проект изменился. Workspace сохранён. "
+            f"{_short_error(exc, 90)}",
+            show_alert=True,
+        )
+        return
+    except TaskWorkspaceError as exc:
+        await cq.answer(
+            f"Не удалось применить изменения: {_short_error(exc)}", show_alert=True
+        )
+        return
+    from bot.handlers.message import resume_queue_processing
+    from bot.services.task_service import log_task_event
+
+    await resume_queue_processing(workspace.thread_id, bot, cq.message.chat.id)
+    try:
+        await log_task_event(
+            task_id,
+            "git",
+            "Task patch applied to source workspace" if changed else "Task had no changes",
+        )
+    except Exception:
+        logger.exception("Failed to log acceptance of task #%s", task_id)
+    await cq.answer("Изменения этой задачи применены")
+    try:
+        await cq.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
-# ── Git Rollback & Agent Memory Sync ─────────────────────────────────────
+# ── Task Workspace Discard ────────────────────────────────────────────────
 
-@router.callback_query(F.data.startswith("rollback:"))
+@router.callback_query(F.data.startswith("t:rb:"))
 async def cb_rollback(cq: CallbackQuery, bot: Bot) -> None:
     assert cq.from_user and cq.message
-    thread_id = int(cq.data.split(":")[1])  # type: ignore[union-attr]
-    session = await db.get_session(thread_id)
-
-    if not session:
-        await cq.answer("Сессия не найдена", show_alert=True)
+    try:
+        task_id = int(cq.data.split(":")[-1])  # type: ignore[union-attr]
+    except ValueError:
+        await cq.answer("Некорректный ID задачи", show_alert=True)
         return
-
-    ws = session["workdir"]
-    # Parse commit_hash if available
-    parts = cq.data.split(":")
-    commit_hash = parts[2] if len(parts) > 2 else None
-
-    # 1. Execute Git Rollback
-    if commit_hash:
-        ok = await git_manager.rollback_to_commit_async(ws, commit_hash)
-    else:
-        ok = await git_manager.rollback_async(ws)
-
-    if ok:
-        await cq.answer("Изменения откатаны!", show_alert=True)
-
-        # 2. Update Telegram status message
-        try:
-            await cq.message.edit_text(
-                "⏪ <b>Изменения откатаны:</b>\nВсе файлы возвращены к исходному состоянию, новые файлы удалены.",
-                parse_mode="HTML",
-                reply_markup=None,
-            )
-        except Exception:
-            pass
-
-        # 2.5 Delete telegram messages associated with this deep rollback
-        from bot.services.tracker import thread_messages_registry
-        t_reg = thread_messages_registry.get(thread_id, [])
-        to_delete = [msg_id for msg_id in t_reg if msg_id > cq.message.message_id]
-        
-        if to_delete:
-            # Clean up the registry
-            thread_messages_registry[thread_id] = [msg_id for msg_id in t_reg if msg_id <= cq.message.message_id]
-            
-            # Delete in chunks of 100
-            for i in range(0, len(to_delete), 100):
-                chunk = to_delete[i:i+100]
-                try:
-                    await bot.delete_messages(cq.message.chat.id, chunk)
-                except Exception as e:
-                    import logging
-                    logging.getLogger(__name__).warning("Failed to delete deep rollback messages: %s", e)
-
-        import uuid as _uuid
-        _NAMESPACE_TG = _uuid.UUID('6ba7b810-9ed0-11d1-80b4-00c04fd430c8')
-        conv_id = str(_uuid.uuid5(_NAMESPACE_TG, f"thread-{thread_id}"))
-        
-        # 3. Synchronize agy Agent Memory — clean prompt, no [SYSTEM:] injection
-        sync_prompt = (
-            "Пользователь отменил твои последние изменения. "
-            "Файлы откачены к исходному состоянию. Забудь последний шаг и жди указаний."
+    workspace = await task_workspace_manager.get(task_id)
+    if not workspace:
+        await cq.answer("Изолированный workspace задачи не найден", show_alert=True)
+        return
+    try:
+        await task_workspace_manager.discard(task_id)
+    except TaskWorkspaceError as exc:
+        await cq.answer(
+            f"Не удалось отбросить изменения: {_short_error(exc)}", show_alert=True
         )
-        asyncio.create_task(
-            run_agy(
-                prompt=sync_prompt,
-                conversation_id=conv_id,
-                workspace_dir=ws,
-                on_chunk=lambda _: asyncio.sleep(0),
-                bot=bot,
-                chat_id=cq.message.chat.id,
-                thread_id=thread_id,
-            )
+        return
+    from bot.handlers.message import resume_queue_processing
+    from bot.services.task_service import log_task_event
+
+    await resume_queue_processing(workspace.thread_id, bot, cq.message.chat.id)
+    try:
+        await log_task_event(
+            task_id, "git", "Task workspace discarded; source was untouched"
         )
-    else:
-        await cq.answer("Ошибка отката изменений.", show_alert=True)
+    except Exception:
+        logger.exception("Failed to log discard of task #%s", task_id)
+    await cq.answer("Изменения задачи отброшены; исходный проект не изменялся")
+    try:
+        await cq.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("accept_diff:") | F.data.startswith("rollback:"))
+async def cb_unsafe_legacy_git_action(cq: CallbackQuery) -> None:
+    """Refuse source-wide buttons left in messages created by older releases."""
+    await cq.answer(
+        "Массовый accept/rollback отключён: используйте кнопки конкретной задачи.",
+        show_alert=True,
+    )
 
 
 # ── Task Management Callbacks ──────────────────────────────────────────────
@@ -333,10 +357,8 @@ async def cb_retry_task(cq: CallbackQuery, bot: Bot) -> None:
         model=task.get("model"),
         retry_of_task_id=task_id,
     )
-    from bot.handlers.message import _process_queue, _queue_loops
-    if task["thread_id"] not in _queue_loops:
-        _queue_loops.add(task["thread_id"])
-        asyncio.create_task(_process_queue(task["thread_id"], bot, task["chat_id"]))
+    from bot.handlers.message import _start_queue_processing
+    _start_queue_processing(task["thread_id"], bot, task["chat_id"])
     await cq.answer(f"Задача #{new_id} добавлена в очередь")
 
 

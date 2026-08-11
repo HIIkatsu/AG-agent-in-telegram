@@ -17,12 +17,13 @@ from dataclasses import dataclass, field
 from aiogram import Bot, F, Router
 from aiogram.types import Message
 
-from bot.config import settings
 from bot.db import db
 from bot.services.agy_runner import run_agy
-from bot.services.artifacts import collect_task_artifacts, deliver_and_cleanup_artifacts
-
-from bot.services.git_manager import git_manager
+from bot.services.artifacts import (
+    collect_task_artifacts,
+    deliver_and_cleanup_artifacts,
+    is_managed_workspace_path,
+)
 from bot.services.execution_profiles import (
     CHAT_MEMORY_CHAR_BUDGET,
     CODE_MEMORY_CHAR_BUDGET,
@@ -248,11 +249,23 @@ async def _process(
         model=model
     )
     
-    # Start loop if not running
-    if thread_id not in _queue_loops:
-        _queue_loops.add(thread_id)
-        asyncio.create_task(_process_queue(thread_id, bot, chat_id))
-    else:
+    # Start loop if not running. A pending isolated workspace is an explicit
+    # review barrier; queued prompts resume after Accept or Discard.
+    from bot.services.task_workspace import task_workspace_manager
+
+    blocking = await task_workspace_manager.get_blocking(thread_id)
+    if blocking and thread_id not in _queue_loops:
+        pos = await get_queued_count(thread_id)
+        try:
+            msg = await message.reply(
+                f"⏸ Задача поставлена в очередь (позиция {pos}). "
+                f"Сначала примените или отбросьте изменения задачи #{blocking.task_id}.",
+                disable_notification=True,
+            )
+            t_reg.append(msg.message_id)
+        except Exception:
+            pass
+    elif not _start_queue_processing(thread_id, bot, chat_id):
         pos = await get_queued_count(thread_id)
         try:
             msg = await message.reply(f"⏳ Задача поставлена в очередь (позиция {pos})", disable_notification=True)
@@ -264,12 +277,34 @@ async def _process(
 # To store active tracker/agy_task per thread_id for cancellation
 _active_tasks: dict[int, tuple[TaskTracker, asyncio.Task | None]] = {}
 
+
+def _start_queue_processing(thread_id: int, bot: Bot, chat_id: int) -> bool:
+    """Start one queue runner per thread and report whether it was started."""
+    if thread_id in _queue_loops:
+        return False
+    _queue_loops.add(thread_id)
+    asyncio.create_task(_process_queue(thread_id, bot, chat_id))
+    return True
+
+
+async def resume_queue_processing(thread_id: int, bot: Bot, chat_id: int) -> None:
+    """Resume queued work after a task workspace has been finalized."""
+    for _ in range(100):
+        if thread_id not in _queue_loops:
+            break
+        await asyncio.sleep(0.05)
+    _start_queue_processing(thread_id, bot, chat_id)
+
 async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
     from bot.services.task_service import pop_next_task, finish_task
+    from bot.services.task_service import log_task_event
+    from bot.services.task_workspace import task_workspace_manager
     from bot.services.tracker import thread_messages_registry
     
     try:
         while True:
+            if await task_workspace_manager.has_blocking(thread_id):
+                break
             task = await pop_next_task(thread_id)
             if not task:
                 break
@@ -285,7 +320,8 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 break
                 
             ws = session["workdir"]
-            os.makedirs(ws, exist_ok=True)
+            if not os.path.isdir(ws) and not session.get("is_mounted"):
+                os.makedirs(ws, exist_ok=True)
             from bot.modes import get_mode_config
             mode_config = get_mode_config(mode)
             web_search = effective_web_policy(session.get("web_search"), mode_config["web"])
@@ -314,27 +350,64 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 model=model, mode="⚡ Chat" if execution_profile == "chat" else "🛠 Code task"
             )
             await tracker.start()
+            # Make Stop effective even while the isolated snapshot is being
+            # prepared (before the AGY subprocess exists).
+            _active_tasks[thread_id] = (tracker, None)
 
             import time as _time
             artifacts_started_at = _time.time()
-            commit_hash: str | None = None
+            agent_ws = ws
             if execution_profile == "code":
-                await tracker.on_tool_start("git_checkpoint", "Создаю checkpoint")
+                await tracker.on_tool_start("task_workspace", "Создаю изолированный workspace")
                 try:
-                    commit_hash = await git_manager.create_checkpoint_async(ws, label=prompt[:25], timeout=15)
-                    tracker.commit_hash = commit_hash
-                    await tracker.on_tool_end("git_checkpoint", "DONE")
-                except Exception:
-                    import logging
-                    logging.getLogger(__name__).warning("Git checkpoint unavailable for %s", ws, exc_info=True)
-                    await tracker.on_tool_end("git_checkpoint", "ERROR")
+                    workspace = await task_workspace_manager.prepare(
+                        task_id,
+                        thread_id,
+                        ws,
+                        allow_initialize=not bool(session.get("is_mounted")),
+                    )
+                    agent_ws = workspace.task_workdir
+                    await log_task_event(
+                        task_id,
+                        "git",
+                        "Isolated task workspace created",
+                        workspace.snapshot_commit,
+                    )
+                    await tracker.on_tool_end("task_workspace", "DONE")
+                except Exception as exc:
+                    logger.exception("Failed to prepare isolated workspace for task #%s", task_id)
+                    await tracker.on_tool_end("task_workspace", "ERROR")
+                    await finish_task(task_id, "failed", error=str(exc))
+                    stop_typing.set()
+                    typing_task.cancel()
+                    _active_tasks.pop(thread_id, None)
+                    await tracker.finish("ERROR")
+                    await asyncio.sleep(0.5)
+                    continue
+                if tracker.cancelled:
+                    await finish_task(task_id, "cancelled", error="Cancelled by user")
+                    stop_typing.set()
+                    typing_task.cancel()
+                    _active_tasks.pop(thread_id, None)
+                    try:
+                        await task_workspace_manager.discard(
+                            task_id,
+                            state="cancelled_before_run",
+                            allow_active=True,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to clean cancelled task workspace #%s", task_id
+                        )
+                    await asyncio.sleep(0.5)
+                    continue
             agy_task: asyncio.Task | None = None
 
             try:
                 agy_task = asyncio.create_task(run_agy(
                     prompt=prompt,
                     conversation_id=conversation_id,
-                    workspace_dir=ws,
+                    workspace_dir=agent_ws,
                     on_chunk=tracker.feed_text,
                     bot=bot,
                     chat_id=chat_id,
@@ -362,45 +435,58 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 typing_task.cancel()
                 _active_tasks.pop(thread_id, None)
 
-            # Finalize the visible answer before any artifact scanning/diff work so the
-            # user does not wait on slower post-processing after the model is done.
+            synced_files: list[str] = []
             if execution_profile == "code":
+                # Keep generated scratch artifacts inside the isolated workspace so
+                # they are part of this task's patch, never copied into the source.
+                new_files = await collect_task_artifacts(agent_ws, artifacts_started_at)
+                import shutil
+
+                for fpath in new_files:
+                    if not is_managed_workspace_path(fpath) and os.path.exists(fpath):
+                        dst = os.path.join(agent_ws, os.path.basename(fpath))
+                        try:
+                            shutil.copy2(fpath, dst)
+                            synced_files.append(dst)
+                        except Exception:
+                            logger.exception("Failed to copy scratch artifact into task workspace")
+                    else:
+                        synced_files.append(fpath)
                 try:
-                    tracker.has_changes_after_finish = await git_manager.has_changes_async(ws, timeout=5)
-                except Exception:
-                    tracker.has_changes_after_finish = False
+                    tracker.has_changes_after_finish = await task_workspace_manager.has_changes(task_id)
+                    if tracker.has_changes_after_finish:
+                        await task_workspace_manager.mark_pending(task_id)
+                        await log_task_event(task_id, "git", "Task changes are pending review")
+                except Exception as exc:
+                    # A broken task Git state must block the queue, not silently fall
+                    # back to destructive source-wide operations.
+                    tracker.has_changes_after_finish = True
+                    await task_workspace_manager.mark_pending(task_id)
+                    await log_task_event(task_id, "error", "Could not render task diff", str(exc))
 
             await tracker.finish("TIMEOUT" if task_status == "timeout" else "ERROR" if task_status == "failed" else "CANCELLED" if task_status == "cancelled" else "DONE")
 
-            if (
-                execution_profile == "chat"
-                or task_status in {"cancelled", "failed"}
-                or (task_status == "timeout" and not tracker.has_changes_after_finish)
-            ):
+            if execution_profile == "chat":
                 await asyncio.sleep(0.5)
                 continue
-
-            # Artifact post-tool processing: git changed files + bounded scratchpad scan.
-            new_files = await collect_task_artifacts(ws, artifacts_started_at)
-
-            import shutil
-            synced_files: list[str] = []
-            for fpath in new_files:
-                if settings.workspaces_dir not in fpath and os.path.exists(fpath):
-                    dst = os.path.join(ws, os.path.basename(fpath))
-                    try:
-                        shutil.copy2(fpath, dst)
-                        synced_files.append(dst)
-                    except Exception:
-                        synced_files.append(fpath)
-                else:
-                    synced_files.append(fpath)
 
             if synced_files:
                 from bot.services.tracker import rollback_registry
                 rlist = rollback_registry.setdefault(status_msg.message_id, [])
                 await deliver_and_cleanup_artifacts(bot, chat_id, synced_files, thread_id=thread_id, rollback_list=rlist)
 
+            if tracker.has_changes_after_finish:
+                # Do not let the next task branch from a stale source snapshot.
+                break
+
+            try:
+                await task_workspace_manager.discard(
+                    task_id,
+                    state="unchanged",
+                    allow_active=True,
+                )
+            except Exception:
+                logger.exception("Failed to clean unchanged task workspace #%s", task_id)
             await asyncio.sleep(0.5)
             
     finally:

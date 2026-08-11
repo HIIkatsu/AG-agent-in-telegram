@@ -37,10 +37,6 @@ class StepInfo:
 
 def build_tracker_kb(thread_id: int, ws_dir: str = "", status: str = "running", commit_hash: str | None = None, task_id: int | None = None, has_changes: bool = False) -> InlineKeyboardMarkup | None:
     """Build tracker keyboard based on task status without doing git I/O in render."""
-    rollback_data = f"rollback:{thread_id}"
-    if commit_hash:
-        rollback_data += f":{commit_hash}"
-        
     buttons = []
 
     if status == "running":
@@ -48,20 +44,19 @@ def build_tracker_kb(thread_id: int, ws_dir: str = "", status: str = "running", 
             InlineKeyboardButton(text="⏹ Стоп", callback_data=f"t:st:{task_id}" if task_id else "cancel_gen"),
             InlineKeyboardButton(text="📌 Статус", callback_data=f"t:ss:{task_id}" if task_id else "task_status:0")
         ])
-    elif status == "done":
-        if has_changes:
-            buttons.append([
-                InlineKeyboardButton(text="👀 Diff", callback_data=f"t:df:{task_id or thread_id}"),
-                InlineKeyboardButton(text="✅ Accept", callback_data=f"t:ac:{task_id or thread_id}"),
-            ])
-            buttons.append([InlineKeyboardButton(text="⏪ Rollback", callback_data=rollback_data)])
-    elif status in ("failed", "interrupted", "error"):
+    elif status in ("failed", "interrupted", "error", "timeout", "cancelled"):
         buttons.append([
             InlineKeyboardButton(text="🔁 Retry", callback_data=f"t:rt:{task_id}" if task_id else "retry_task:0"),
             InlineKeyboardButton(text="📄 Logs", callback_data=f"t:lg:{task_id}" if task_id else "view_logs:0")
         ])
-        if has_changes:
-            buttons.append([InlineKeyboardButton(text="⏪ Rollback", callback_data=rollback_data)])
+    if status != "running" and has_changes and task_id:
+        buttons.append([
+            InlineKeyboardButton(text="👀 Diff", callback_data=f"t:df:{task_id}"),
+            InlineKeyboardButton(text="✅ Применить", callback_data=f"t:ac:{task_id}"),
+        ])
+        buttons.append([
+            InlineKeyboardButton(text="🗑 Отбросить", callback_data=f"t:rb:{task_id}")
+        ])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 

@@ -23,15 +23,16 @@ async def build_dashboard_content(thread_id: int) -> tuple[str, InlineKeyboardMa
     mode = session.get("mode", "code")
 
     project_name = os.path.basename(ws)
-    if not os.path.exists(ws):
+    if not os.path.exists(ws) and not session.get("is_mounted"):
         os.makedirs(ws, exist_ok=True)
         await git_manager.init_workspace_async(ws)
 
     # Git stats
-    branch = await git_manager.get_current_branch_async(ws) or "N/A"
     try:
+        branch = await git_manager.get_current_branch_async(ws) or "N/A"
         changed_files_count = len(await git_manager.status_async(ws))
     except Exception:
+        branch = "N/A"
         changed_files_count = 0
 
     # Task stats

@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     agy_path: str = "/root/.local/bin/agy"
     agy_global_skills_dir: str = "~/.gemini/antigravity-cli/skills"
     workspaces_dir: str = "/tmp/workspaces"
+    task_workspaces_dir: str = "/tmp/antigravity-task-workspaces"
     db_path: str = "/opt/antigravity-bot/data/bot.db"
     log_level: str = "INFO"
     config_json_path: str = "/opt/antigravity-bot/config.json"

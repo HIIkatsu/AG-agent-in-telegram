@@ -71,12 +71,13 @@ def check_startup() -> None:
         len(skill_report.removed),
     )
 
-    # Check workspaces dir
-    try:
-        os.makedirs(settings.workspaces_dir, exist_ok=True)
-    except OSError as e:
-        logger.error("Cannot create workspaces_dir %s: %s", settings.workspaces_dir, e)
-        sys.exit(1)
+    # Check source and isolated task workspace roots.
+    for workspace_root in (settings.workspaces_dir, settings.task_workspaces_dir):
+        try:
+            os.makedirs(workspace_root, exist_ok=True)
+        except OSError as e:
+            logger.error("Cannot create workspace directory %s: %s", workspace_root, e)
+            sys.exit(1)
 
 
 async def _set_commands(bot: Bot) -> None:
@@ -115,6 +116,8 @@ async def main() -> None:
         
     from bot.services.task_service import recovery_interrupted_tasks
     await recovery_interrupted_tasks()
+    from bot.services.task_workspace import task_workspace_manager
+    await task_workspace_manager.recover()
 
     bot = Bot(
         token=settings.bot_token,
