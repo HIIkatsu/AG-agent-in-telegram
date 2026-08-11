@@ -108,3 +108,14 @@ async def log_task_event(task_id: int, level: str, message: str, data: str | Non
         (task_id, _now(), level, message, data)
     )
     await db.conn.commit()
+
+async def log_task_events_bulk(task_id: int, events: list[tuple[str, str, str | None]]) -> None:
+    """Add multiple log entries for a task in a single SQLite commit."""
+    if not events:
+        return
+    now = _now()
+    await db.conn.executemany(
+        "INSERT INTO task_logs (task_id, timestamp, level, message, data) VALUES (?, ?, ?, ?, ?)",
+        [(task_id, now, level, message, data) for level, message, data in events],
+    )
+    await db.conn.commit()

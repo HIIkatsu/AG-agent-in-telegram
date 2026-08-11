@@ -1,5 +1,6 @@
 """Git History and Diff UI."""
 
+import asyncio
 import html
 import subprocess
 import os
@@ -13,7 +14,7 @@ from bot.db import db
 router = Router(name="git_ui")
 
 
-def run_git_command(ws: str, cmd: list[str]) -> str:
+def run_git_command(ws: str, cmd: list[str], timeout: float = 5) -> str:
     """Helper to run git commands in workspace."""
     try:
         res = subprocess.run(
@@ -21,13 +22,20 @@ def run_git_command(ws: str, cmd: list[str]) -> str:
             cwd=ws,
             capture_output=True,
             text=True,
-            check=True
+            check=True,
+            timeout=timeout
         )
         return res.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return "Git error: timeout"
     except subprocess.CalledProcessError as e:
         return f"Git error: {e.stderr.strip()}"
     except Exception as e:
         return f"Error: {e}"
+
+
+async def run_git_command_async(ws: str, cmd: list[str], timeout: float = 5) -> str:
+    return await asyncio.to_thread(run_git_command, ws, cmd, timeout)
 
 
 async def build_git_history(thread_id: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -41,7 +49,7 @@ async def build_git_history(thread_id: int) -> tuple[str, InlineKeyboardMarkup]:
         return "Git не инициализирован в проекте.", InlineKeyboardMarkup(inline_keyboard=[])
 
     # Get last 10 commits: hash|author|message
-    log_output = run_git_command(ws, ["log", "-n", "10", "--pretty=format:%h|%an|%s"])
+    log_output = await run_git_command_async(ws, ["log", "-n", "10", "--pretty=format:%h|%an|%s"])
     
     if "Git error" in log_output or "Error:" in log_output:
         if "does not have any commits yet" in log_output:
@@ -109,11 +117,11 @@ async def cb_show_commit(cq: CallbackQuery, bot: Bot) -> None:
 
     # Get diff for the commit
     # 'git diff {hash}^!' shows the changes introduced by {hash}
-    diff_output = run_git_command(ws, ["diff", f"{short_hash}^!"])
+    diff_output = await run_git_command_async(ws, ["diff", f"{short_hash}^!"])
     
     if "Git error" in diff_output or not diff_output:
         # Maybe it's the root commit, try git show
-        diff_output = run_git_command(ws, ["show", short_hash, "--format="])
+        diff_output = await run_git_command_async(ws, ["show", short_hash, "--format="])
 
     if "Git error" in diff_output or not diff_output:
         await cq.answer("Не удалось получить изменения.", show_alert=True)

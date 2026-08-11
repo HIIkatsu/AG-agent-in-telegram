@@ -12,7 +12,6 @@ from datetime import datetime
 from aiogram import Bot
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from bot.services.git_manager import git_manager
 from bot.utils.telegram_renderer import chunk_text, part_label, render_markdown, strip_telegram_html
 
 logger = logging.getLogger(__name__)
@@ -34,10 +33,8 @@ class StepInfo:
     status: str = "IN_PROGRESS"  # IN_PROGRESS, DONE, ERROR, DENIED
 
 
-def build_tracker_kb(thread_id: int, ws_dir: str = "", status: str = "running", commit_hash: str | None = None, task_id: int | None = None) -> InlineKeyboardMarkup | None:
-    """Build tracker keyboard based on task status."""
-    has_changes = bool(ws_dir and git_manager.has_changes(ws_dir))
-    
+def build_tracker_kb(thread_id: int, ws_dir: str = "", status: str = "running", commit_hash: str | None = None, task_id: int | None = None, has_changes: bool = False) -> InlineKeyboardMarkup | None:
+    """Build tracker keyboard based on task status without doing git I/O in render."""
     rollback_data = f"rollback:{thread_id}"
     if commit_hash:
         rollback_data += f":{commit_hash}"
@@ -79,7 +76,7 @@ class TaskTracker:
         self.thread_id = thread_id
         self.status_msg = status_message
         self.ws_dir = ws_dir
-        self.debounce = debounce
+        self.debounce = max(debounce, 1.5)
         self.commit_hash = commit_hash
         self.task_id = task_id
         self.model = model
@@ -98,6 +95,8 @@ class TaskTracker:
         self._finish_status = "DONE"
 
         self._render_task: asyncio.Task | None = None
+        self.has_changes_after_finish = False
+        self._pending_log_events: list[tuple[str, str, str | None]] = []
 
     @property
     def cancelled(self) -> bool:
@@ -124,9 +123,7 @@ class TaskTracker:
             self._current_step_idx = len(self.steps) - 1
 
         if self.task_id:
-            from bot.services.task_service import log_task_event
-            await log_task_event(self.task_id, "tool_start", label, tool_name)
-        await self.render(force=True)
+            self._pending_log_events.append(("tool_start", label, tool_name))
 
     async def on_tool_end(self, tool_name: str, status: str = "DONE") -> None:
         """Lifecycle hook when a tool finishes executing."""
@@ -135,9 +132,7 @@ class TaskTracker:
                 self.steps[self._current_step_idx].status = status
 
         if self.task_id:
-            from bot.services.task_service import log_task_event
-            await log_task_event(self.task_id, f"tool_{status.lower()}", tool_name)
-        await self.render(force=True)
+            self._pending_log_events.append((f"tool_{status.lower()}", tool_name, None))
 
     async def cancel(self) -> None:
         self._cancelled = True
@@ -146,8 +141,8 @@ class TaskTracker:
         if self._render_task and not self._render_task.done():
             self._render_task.cancel()
         if self.task_id:
-            from bot.services.task_service import log_task_event
-            await log_task_event(self.task_id, "cancelled", "Задача отменена пользователем")
+            self._pending_log_events.append(("cancelled", "Задача отменена пользователем", None))
+            await self._flush_log_events()
         try:
             await self.status_msg.edit_text("Генерация отменена.")
         except Exception:
@@ -162,12 +157,14 @@ class TaskTracker:
                 await self._render_task
             except asyncio.CancelledError:
                 pass
+        await self._flush_log_events()
         await self.render(force=True, final=True)
 
     async def _render_loop(self) -> None:
         while not self._finished:
             await asyncio.sleep(self.debounce)
             self._spinner_idx = (self._spinner_idx + 1) % len(_SPINNER)
+            await self._flush_log_events()
             await self.render()
 
     async def render(self, force: bool = False, final: bool = False) -> None:
@@ -229,10 +226,17 @@ class TaskTracker:
             elif steps_copy:
                 step_lines[-1] = step_lines[-1].replace("├─", "└─")
 
-        rendered_response = render_markdown(buffer_copy.strip())
-        clean_text = rendered_response.html
+        if final:
+            rendered_response = render_markdown(buffer_copy.strip())
+            clean_text = rendered_response.html
+        else:
+            preview = buffer_copy.strip()
+            if len(preview) > 1000:
+                preview = "…" + preview[-1000:]
+            import html as _html
+            clean_text = _html.escape(preview)
         status = self._finish_status.lower() if final else "running"
-        kb = build_tracker_kb(self.thread_id, ws_dir=self.ws_dir, status=status, commit_hash=self.commit_hash, task_id=self.task_id)
+        kb = build_tracker_kb(self.thread_id, ws_dir=self.ws_dir, status=status, commit_hash=self.commit_hash, task_id=self.task_id, has_changes=self.has_changes_after_finish)
 
         if final:
             sent_msg_ids = []
@@ -241,7 +245,7 @@ class TaskTracker:
                 # No tools used (simple answer). Transform the status message directly into the final answer.
                 chunks = chunk_text(clean_text, max_len=4000)
                 try:
-                    await self._safe_edit(self.status_msg, chunks[0], reply_markup=kb)
+                    await self._safe_edit(self.status_msg, chunks[0], reply_markup=kb, final=True)
                     # If there are more chunks, send them as replies
                     if len(chunks) > 1:
                         reply_id = self.status_msg.reply_to_message.message_id if self.status_msg.reply_to_message else None
@@ -269,7 +273,7 @@ class TaskTracker:
             if not clean_text:
                 loading_text += "\n└─ [ℹ️] Пустой ответ"
             
-            await self._safe_edit(self.status_msg, loading_text, reply_markup=kb)
+            await self._safe_edit(self.status_msg, loading_text, reply_markup=kb, final=True)
             self._last_rendered_text = loading_text
             
             if clean_text:
@@ -337,12 +341,23 @@ class TaskTracker:
 
         try:
             chunks = chunk_text(rendered, max_len=4000)
-            await self._safe_edit(self.status_msg, chunks[0], reply_markup=kb)
+            await self._safe_edit(self.status_msg, chunks[0], reply_markup=kb, final=final, force=force)
             self._last_rendered_text = rendered
         except Exception as e:
             logger.debug("Render edit error: %s", e)
 
-    async def _safe_edit(self, msg: Message, html_text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
+    async def _flush_log_events(self) -> None:
+        if not self.task_id or not self._pending_log_events:
+            return
+        events = self._pending_log_events
+        self._pending_log_events = []
+        from bot.services.task_service import log_task_events_bulk
+        await log_task_events_bulk(self.task_id, events)
+
+    async def _safe_edit(self, msg: Message, html_text: str, reply_markup: InlineKeyboardMarkup | None = None, final: bool = False, force: bool = False) -> None:
+        from bot.services.telegram_rate_limiter import telegram_rate_limiter
+        if not await telegram_rate_limiter.allow_edit(msg.chat.id, msg.message_id, final=final, force=force):
+            return
         try:
             await msg.edit_text(html_text, parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=True)
         except Exception as exc:
@@ -351,7 +366,11 @@ class TaskTracker:
                 return
             if "Too Many Requests" in err or "retry after" in err.lower():
                 m = re.search(r"retry after (\d+)", err, re.IGNORECASE)
-                await asyncio.sleep(int(m.group(1)) if m else 3)
+                retry_after = int(m.group(1)) if m else 3
+                await telegram_rate_limiter.set_retry_after(msg.chat.id, msg.message_id, retry_after)
+                if not final and not force:
+                    return
+                await asyncio.sleep(retry_after)
                 try:
                     await msg.edit_text(html_text, parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=True)
                 except Exception:

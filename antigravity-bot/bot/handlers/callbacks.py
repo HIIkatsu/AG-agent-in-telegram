@@ -140,7 +140,7 @@ async def cb_view_diff(cq: CallbackQuery, bot: Bot) -> None:
         return
 
     ws = session["workdir"]
-    raw_diff = git_manager.get_diff(ws)
+    raw_diff = await git_manager.get_diff_async(ws)
 
     if not raw_diff or not raw_diff.strip():
         await cq.answer("Нет измененных файлов.", show_alert=True)
@@ -171,7 +171,7 @@ async def cb_accept_diff(cq: CallbackQuery) -> None:
     session = await db.get_session(thread_id)
     if session:
         ws = session["workdir"]
-        git_manager.accept(ws)
+        await git_manager.accept_async(ws)
         await cq.answer("Изменения приняты!")
         try:
             await cq.message.edit_reply_markup(reply_markup=None)
@@ -200,9 +200,9 @@ async def cb_rollback(cq: CallbackQuery, bot: Bot) -> None:
 
     # 1. Execute Git Rollback
     if commit_hash:
-        ok = git_manager.rollback_to_commit(ws, commit_hash)
+        ok = await git_manager.rollback_to_commit_async(ws, commit_hash)
     else:
-        ok = git_manager.rollback(ws)
+        ok = await git_manager.rollback_async(ws)
 
     if ok:
         await cq.answer("Изменения откатаны!", show_alert=True)
@@ -289,7 +289,6 @@ async def cb_cancel_task(cq: CallbackQuery) -> None:
             return
             
     # If not running, just cancel in DB
-    from bot.services.task_service import cancel_task
     await cancel_task(task_id)
     await cq.answer("Задача отменена!")
 
