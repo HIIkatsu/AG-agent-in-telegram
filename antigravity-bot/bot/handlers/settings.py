@@ -1,6 +1,7 @@
 """Settings router and screens."""
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -9,6 +10,19 @@ from bot.db import db
 from bot.modes import MODES
 
 router = Router(name="settings")
+
+
+async def _edit_settings_message(
+    cq: CallbackQuery, text: str, kb: InlineKeyboardMarkup
+) -> None:
+    """Edit a settings screen, ignoring Telegram's harmless no-op response."""
+    try:
+        await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except TelegramBadRequest as exc:
+        # Repeated taps can render exactly the screen already shown. Telegram
+        # reports that idempotent edit as an error even though the UI is valid.
+        if "message is not modified" not in exc.message.lower():
+            raise
 
 
 async def build_settings_main(thread_id: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -55,7 +69,7 @@ async def cmd_settings(message: Message) -> None:
 async def cb_project_settings(cq: CallbackQuery) -> None:
     thread_id = int(cq.data.split(":")[1])
     text, kb = await build_settings_main(thread_id)
-    await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await _edit_settings_message(cq, text, kb)
 
 
 @router.callback_query(F.data.startswith("set_menu:"))
@@ -112,7 +126,7 @@ async def _show_settings_menu(cq: CallbackQuery, menu: str, thread_id: int) -> N
             [InlineKeyboardButton(text="◀️ Назад", callback_data=f"project_settings:{thread_id}")]
         ])
 
-    await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await _edit_settings_message(cq, text, kb)
 
 
 @router.callback_query(F.data.startswith("set_val:"))
