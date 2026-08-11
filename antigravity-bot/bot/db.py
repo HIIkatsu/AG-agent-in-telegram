@@ -79,6 +79,24 @@ CREATE TABLE IF NOT EXISTS task_artifacts (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS task_workspaces (
+    task_id INTEGER PRIMARY KEY REFERENCES tasks(id),
+    thread_id INTEGER NOT NULL,
+    source_workdir TEXT NOT NULL,
+    source_root TEXT NOT NULL,
+    source_subdir TEXT NOT NULL DEFAULT '',
+    task_root TEXT NOT NULL UNIQUE,
+    task_workdir TEXT NOT NULL UNIQUE,
+    snapshot_commit TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    finalized_at TEXT,
+    error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_workspaces_thread_state
+    ON task_workspaces(thread_id, state);
+
 CREATE TABLE IF NOT EXISTS callback_paths (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     path TEXT NOT NULL UNIQUE,

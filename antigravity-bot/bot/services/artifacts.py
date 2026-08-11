@@ -36,6 +36,22 @@ _DEFAULT_SCRATCH_DIRS = [
     "/root/.gemini/antigravity-ide/scratch",
 ]
 
+
+def is_managed_workspace_path(raw_path: str | Path) -> bool:
+    """Return whether a path belongs to a source or isolated task workspace."""
+    path = Path(raw_path).resolve(strict=False)
+    roots = (
+        Path(settings.workspaces_dir).expanduser().resolve(strict=False),
+        Path(settings.task_workspaces_dir).expanduser().resolve(strict=False),
+    )
+    for root in roots:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
 def _is_valid_dir(d: Path) -> bool:
     name = d.name
     if name.startswith("."):
@@ -83,8 +99,7 @@ def diff_snapshots(
     deduped: list[str] = []
 
     # Sort workspace paths first
-    ws_dir = str(Path(settings.workspaces_dir).resolve())
-    changed_paths.sort(key=lambda p: (0 if p.startswith(ws_dir) else 1, p))
+    changed_paths.sort(key=lambda p: (0 if is_managed_workspace_path(p) else 1, p))
 
     for p in changed_paths:
         name = os.path.basename(p)
@@ -123,8 +138,6 @@ async def deliver_and_cleanup_artifacts(
     rollback_list: list[int] | None = None,
 ) -> None:
     """Send detected artifacts as documents to Telegram without deleting workspace project files."""
-    ws_dir = str(Path(settings.workspaces_dir).resolve())
-    
     for fpath_str in files:
         fpath = Path(fpath_str)
         if not fpath.exists():
@@ -149,7 +162,7 @@ async def deliver_and_cleanup_artifacts(
                     logger.exception("Failed to deliver artifact %s to Telegram", fpath)
 
         # ONLY clean up temporary scratchpad files. NEVER delete user's workspace files!
-        if not str(fpath).startswith(ws_dir):
+        if not is_managed_workspace_path(fpath):
             try:
                 fpath.unlink(missing_ok=True)
                 logger.info("Cleaned up scratchpad file from disk: %s", fpath)

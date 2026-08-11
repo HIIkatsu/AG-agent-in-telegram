@@ -21,6 +21,10 @@ def test_fresh_database_creates_environments_table(tmp_path: Path) -> None:
         database._path = str(tmp_path / "fresh.db")
         await database.connect()
         try:
+            cursor = await database.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_workspaces'"
+            )
+            assert await cursor.fetchone() is not None
             await database.add_environment(
                 "home",
                 "host.example",

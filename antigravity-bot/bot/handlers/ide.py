@@ -49,6 +49,7 @@ def _task_line(row: dict) -> str:
 
 async def build_task_card(task_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
     from bot.services.task_service import get_task
+    from bot.services.task_workspace import task_workspace_manager
 
     task = await get_task(task_id)
     if not task:
@@ -69,15 +70,33 @@ async def build_task_card(task_id: int) -> tuple[str, InlineKeyboardMarkup | Non
         lines += ["", "<b>Ошибка:</b>", f"<code>{html.escape(task['error'])}</code>"]
     if task.get("result_summary"):
         lines += ["", "<b>Результат:</b>", html.escape(task["result_summary"][:900])]
+    workspace = await task_workspace_manager.get(task_id)
+    if workspace:
+        lines += ["", f"Изменения: <code>{html.escape(workspace.state)}</code>"]
+        if workspace.error:
+            lines.append(f"<code>{html.escape(workspace.error[:500])}</code>")
     if logs:
         lines += ["", "<b>Последние события:</b>"]
         for row in reversed(logs):
             lines.append(f"• <code>{html.escape(row['level'])}</code> {html.escape(row['message'][:180])}")
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📄 Логи", callback_data=f"t:lg:{task_id}"), InlineKeyboardButton(text="🔁 Retry", callback_data=f"t:rt:{task_id}")],
-        [InlineKeyboardButton(text="👀 Diff", callback_data=f"t:df:{task_id}"), InlineKeyboardButton(text="⏹ Cancel", callback_data=f"t:st:{task_id}")],
-    ])
+    buttons = [[
+        InlineKeyboardButton(text="📄 Логи", callback_data=f"t:lg:{task_id}"),
+        InlineKeyboardButton(text="🔁 Retry", callback_data=f"t:rt:{task_id}"),
+    ]]
+    if workspace and workspace.state in {"pending", "conflict"}:
+        buttons.append([
+            InlineKeyboardButton(text="👀 Diff", callback_data=f"t:df:{task_id}"),
+            InlineKeyboardButton(text="✅ Применить", callback_data=f"t:ac:{task_id}"),
+        ])
+        buttons.append([
+            InlineKeyboardButton(text="🗑 Отбросить", callback_data=f"t:rb:{task_id}")
+        ])
+    elif task["status"] in {"queued", "running"} or (workspace and workspace.state == "active"):
+        buttons.append([
+            InlineKeyboardButton(text="⏹ Cancel", callback_data=f"t:st:{task_id}")
+        ])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     return "\n".join(lines), kb
 
 
@@ -262,14 +281,17 @@ async def cmd_diff(message: Message, bot: Bot) -> None:
         return
     session = await db.get_or_create_session(thread_id)
     ws = session["workdir"]
-    status = await git_manager.status_async(ws)
+    try:
+        status = await git_manager.status_async(ws)
+    except Exception as exc:
+        await message.answer(f"Git diff недоступен: <code>{html.escape(str(exc))}</code>", parse_mode="HTML")
+        return
     if not status:
         await message.answer("✅ Изменений нет.")
         return
-    text = "👀 <b>Diff workflow</b>\n\n<pre>" + html.escape("\n".join(status[:60])) + "</pre>"
+    text = "👀 <b>Diff исходного проекта (только чтение)</b>\n\n<pre>" + html.escape("\n".join(status[:60])) + "</pre>"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📄 diff.html", callback_data=f"view_diff:{thread_id}"), InlineKeyboardButton(text="📦 patch", callback_data=f"diff_patch:{thread_id}")],
-        [InlineKeyboardButton(text="✅ Accept all", callback_data=f"accept_diff:{thread_id}"), InlineKeyboardButton(text="↩️ Rollback all", callback_data=f"rollback:{thread_id}")],
         [InlineKeyboardButton(text="🧪 Run tests", callback_data=f"run_tests:{thread_id}")],
     ])
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
@@ -427,14 +449,20 @@ async def cb_open_diff(cq: CallbackQuery) -> None:
     if not session:
         await cq.answer("Сессия не найдена", show_alert=True)
         return
-    status = await git_manager.status_async(session["workdir"])
+    try:
+        status = await git_manager.status_async(session["workdir"])
+    except Exception as exc:
+        await cq.answer(
+            f"Git diff недоступен: {str(exc).replace(chr(10), ' ')[:140]}",
+            show_alert=True,
+        )
+        return
     if not status:
         await cq.answer("Изменений нет", show_alert=True)
         return
-    text = "👀 <b>Diff workflow</b>\n\n<pre>" + html.escape("\n".join(status[:60])) + "</pre>"
+    text = "👀 <b>Diff исходного проекта (только чтение)</b>\n\n<pre>" + html.escape("\n".join(status[:60])) + "</pre>"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📄 diff.html", callback_data=f"view_diff:{thread_id}"), InlineKeyboardButton(text="📦 patch", callback_data=f"diff_patch:{thread_id}")],
-        [InlineKeyboardButton(text="✅ Accept all", callback_data=f"accept_diff:{thread_id}"), InlineKeyboardButton(text="↩️ Rollback all", callback_data=f"rollback:{thread_id}")],
         [InlineKeyboardButton(text="🧪 Run tests", callback_data=f"run_tests:{thread_id}")],
     ])
     await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb)  # type: ignore[union-attr]
