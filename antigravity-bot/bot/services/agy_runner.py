@@ -6,7 +6,9 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -18,6 +20,20 @@ from bot.services.tracker import TaskTracker
 from bot.utils.sanitizer import IncrementalStreamDecoder
 
 logger = logging.getLogger(__name__)
+
+
+async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
+    """Terminate the isolated CLI process group and reap it within a bounded time."""
+    if proc.returncode is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        proc.kill()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except TimeoutError:
+        logger.error("agy process %s could not be reaped after SIGKILL", proc.pid)
 
 # System rules written to .agents/AGENTS.md in workdir — CLI reads this
 # as workspace-scoped rules natively, without polluting conversation history.
@@ -49,14 +65,23 @@ _AGENTS_MD_CONTENT = """\
 
 _WEB_SEARCH_RULE = """
 ## Web Search
-- Обязательно используй веб-поиск или спарси нужную страницу
-  через bash/curl перед формулированием ответа.
+- Ты ОБЯЗАН первично использовать инструмент поиска в интернете перед формированием ответа.
 """
 
-_WEB_SEARCH_AUTO_RULE = """
+_WEB_SEARCH_OFF_RULE = """
 ## Web Search
-- Используй веб-поиск только если запрос требует актуальных или проверяемых данных.
+- Веб-поиск выключен. Не используй search_web, read_url_content, curl, wget или другие способы доступа в интернет.
 """
+
+
+@lru_cache(maxsize=1)
+def _instructions_content() -> str:
+    instructions_file = Path(__file__).resolve().parent.parent.parent / "INSTRUCTIONS.md"
+    try:
+        return instructions_file.read_text(encoding="utf-8") if instructions_file.exists() else ""
+    except OSError as exc:
+        logger.warning("Failed to read INSTRUCTIONS.md: %s", exc)
+        return ""
 
 
 def _ensure_agents_md(workspace_dir: str, mode: str = "code", web_search: str = "off") -> None:
@@ -72,19 +97,16 @@ def _ensure_agents_md(workspace_dir: str, mode: str = "code", web_search: str = 
     content = _AGENTS_MD_CONTENT
     content += f"\n## Mode: {cfg['name']}\n- {cfg['prompt']}\n"
     
-    if web_search == "required":
+    if web_search in {"on", "required"}:
         content += _WEB_SEARCH_RULE
-    elif web_search == "auto":
-        content += _WEB_SEARCH_AUTO_RULE
+    else:
+        content += _WEB_SEARCH_OFF_RULE
         
     # Inject INSTRUCTIONS.md if it exists
     bot_root = Path(__file__).resolve().parent.parent.parent
-    instructions_file = bot_root / "INSTRUCTIONS.md"
-    if instructions_file.exists():
-        try:
-            content += "\n" + instructions_file.read_text(encoding="utf-8") + "\n"
-        except OSError as exc:
-            logger.warning("Failed to read INSTRUCTIONS.md: %s", exc)
+    instructions = _instructions_content()
+    if instructions:
+        content += "\n" + instructions + "\n"
 
     try:
         # Only rewrite if content changed (avoid unnecessary disk writes)
@@ -128,9 +150,10 @@ async def run_agy(
     # CLEAN prompt — no [SYSTEM:] injection. Rules come from .agents/AGENTS.md
     full_prompt = prompt
     if is_chat:
+        web_rule = _WEB_SEARCH_RULE if web_search in {"on", "required"} else _WEB_SEARCH_OFF_RULE
         full_prompt = (
             "Ответь на русском языке прямо и кратко. Не используй инструменты и не читай "
-            "файлы, если пользователь явно этого не просил.\n\n" + prompt
+            "файлы, если пользователь явно этого не просил.\n" + web_rule + "\n" + prompt
         )
 
     cmd = [
@@ -178,6 +201,7 @@ async def run_agy(
         stderr=asyncio.subprocess.PIPE,
         cwd=execution_dir,
         env=env,
+        start_new_session=True,
     )
 
     decoder = IncrementalStreamDecoder("utf-8", errors="replace")
@@ -330,21 +354,13 @@ async def run_agy(
 
     except TimeoutError:
         logger.error("agy execution timed out (%ds limit)", settings.task_timeout_seconds)
-        try:
-            proc.kill()
-            await proc.wait()
-        except Exception:
-            pass
+        await _terminate_process(proc)
         minutes = settings.task_timeout_seconds // 60
         timeout_msg = f"\n\n❌ **Ошибка выполнения:**\n```\nПревышен таймаут выполнения задачи ({minutes} минут). Процесс принудительно остановлен.\n```"
         full_response += timeout_msg
         await on_chunk(timeout_msg)
     except asyncio.CancelledError:
-        try:
-            proc.kill()
-            await proc.wait()
-        except Exception:
-            pass
+        await _terminate_process(proc)
         raise
     except Exception as exc:
         logger.exception("agy execution error")

@@ -111,13 +111,13 @@ async def _show_settings_menu(cq: CallbackQuery, menu: str, thread_id: int) -> N
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"project_settings:{thread_id}")])
         kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     elif menu == "web":
-        text = f"🌐 <b>Веб-поиск:</b> {session.get('web_search', 'off')}\nВыберите режим:"
+        enabled = session.get("web_search", "off") in {"on", "required"}
+        text = "🌐 <b>Веб-поиск</b>\nПоиск включён." if enabled else "🌐 <b>Веб-поиск</b>\nПоиск выключен."
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Выключен (off)", callback_data=f"set_val:web:off:{thread_id}"),
-                InlineKeyboardButton(text="Авто (auto)", callback_data=f"set_val:web:auto:{thread_id}"),
-                InlineKeyboardButton(text="Всегда (required)", callback_data=f"set_val:web:required:{thread_id}")
-            ],
+            [InlineKeyboardButton(
+                text=f"🌐 Веб-поиск: {'Вкл' if enabled else 'Выкл'}",
+                callback_data=f"set_val:web:{'off' if enabled else 'on'}:{thread_id}",
+            )],
             [InlineKeyboardButton(text="◀️ Назад", callback_data=f"project_settings:{thread_id}")]
         ])
     else:

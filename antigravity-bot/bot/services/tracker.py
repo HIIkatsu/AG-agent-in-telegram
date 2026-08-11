@@ -6,6 +6,8 @@ import asyncio
 import logging
 import os
 import re
+import shutil
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -435,12 +437,13 @@ class TaskTracker:
                 snippets_count += 1
                 ext = ext_map.get(lang, ".txt") if lang else ".txt"
                 filename = f"snippet_{snippets_count}{ext}"
-                file_path = os.path.join(self.ws_dir, filename)
+                temp_dir = tempfile.mkdtemp(prefix="agy-snippets-")
+                file_path = os.path.join(temp_dir, filename)
                 
                 await asyncio.to_thread(self._write_text_file, file_path, code)
                 snippets_to_send.append((file_path, filename))
                 
-                placeholder = f"📄 [Сгенерирован файл: {filename} | {lines_count} строк]"
+                placeholder = f"📄 [Код отправлен файлом: {filename} | {lines_count} строк]"
                 
                 result.append(text[offset:m.start()])
                 result.append(placeholder)
@@ -464,16 +467,20 @@ class TaskTracker:
 
     async def _send_snippet_documents(self, snippets: list[tuple[str, str]]) -> None:
         sent_msg_ids = []
-        for file_path, filename in snippets:
-            try:
-                msg = await self.bot.send_document(
-                    self.status_msg.chat.id,
-                    FSInputFile(file_path, filename=filename),
-                    message_thread_id=self.thread_id if self.thread_id else None,
-                )
-                sent_msg_ids.append(msg.message_id)
-            except Exception as e:
-                logger.error("Failed to send snippet %s: %s", filename, e)
+        try:
+            for file_path, filename in snippets:
+                try:
+                    msg = await self.bot.send_document(
+                        self.status_msg.chat.id,
+                        FSInputFile(file_path, filename=filename),
+                        message_thread_id=self.thread_id if self.thread_id else None,
+                    )
+                    sent_msg_ids.append(msg.message_id)
+                except Exception as e:
+                    logger.error("Failed to send snippet %s: %s", filename, e)
+        finally:
+            for directory in {os.path.dirname(path) for path, _ in snippets}:
+                await asyncio.to_thread(shutil.rmtree, directory, True)
 
         if sent_msg_ids:
             rollback_registry.setdefault(self.status_msg.message_id, []).extend(sent_msg_ids)

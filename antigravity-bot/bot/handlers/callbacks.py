@@ -283,6 +283,10 @@ async def cb_cancel_task(cq: CallbackQuery) -> None:
             await tracker.cancel()
             if agy_task and not agy_task.done():
                 agy_task.cancel()
+                try:
+                    await agy_task
+                except asyncio.CancelledError:
+                    pass
             from bot.services.task_service import cancel_queue
             await cancel_queue(thread_id)
             await cq.answer("Текущая генерация и вся очередь отменены!")

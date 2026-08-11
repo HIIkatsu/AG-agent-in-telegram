@@ -4,17 +4,17 @@ MODES = {
     "chat": {
         "name": "⚡ Chat",
         "prompt": "General assistant. Answer directly and do not use tools when a text answer is sufficient.",
-        "web": "off"
+        "web": "off",
     },
     "plan": {
         "name": "Plan", 
         "prompt": "Break tasks into step-by-step specs. Do not write full code. Focus on architecture, logic, and planning.", 
-        "web": "off"
+        "web": "off",
     },
     "code": {
         "name": "🛠 Code task",
         "prompt": "Write modular, clean code with strict typing. You are an expert software engineer.", 
-        "web": "off"
+        "web": "off",
     }
 }
 
