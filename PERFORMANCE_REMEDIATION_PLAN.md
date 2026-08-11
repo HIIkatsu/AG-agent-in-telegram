@@ -265,6 +265,9 @@ while True:
 
 ### 1.11. Убрать auto-send diff.html из завершения задачи
 
+**Статус: выполнено.** Diff формируется лениво по кнопке под ответом или при выборе
+коммита в Git History; завершение задачи больше не генерирует и не загружает файл.
+
 Файл: `bot/handlers/message.py`
 
 После задачи:
@@ -326,6 +329,9 @@ await bot.send_document(...)
 
 ### 2.1. Разделить быстрый chat pipeline и тяжёлый code-task pipeline
 
+**Статус: выполнено.** Добавлены отдельные execution profiles: chat не делает
+checkpoint/artifact scan/diff и запускается без project `--add-dir`; code сохраняет IDE pipeline.
+
 Файлы:
 
 - `bot/handlers/message.py`
@@ -361,6 +367,9 @@ await bot.send_document(...)
 
 ### 2.2. Нормализовать web_search policy по режимам и типу запроса
 
+**Статус: выполнено.** Политика вычисляется из настройки сессии и default выбранного
+режима; `auto` больше не превращается в обязательный web search.
+
 `bot/modes.py`:
 
 ```python
@@ -394,6 +403,9 @@ web_search: str = session.get("web_search", "off")
 
 ### 2.3. Добавить intent classifier для выбора fast chat или code task
 
+**Статус: выполнено.** Детерминированный classifier учитывает вложения и явные
+project/file/command triggers, а UI показывает выбранный профиль.
+
 Сейчас любое текстовое сообщение в topic превращается в полноценную задачу. Нет классификации:
 
 - “привет”
@@ -421,6 +433,10 @@ web_search: str = session.get("web_search", "off")
 6. В UI показать выбранный профиль: `⚡ Chat` или `🛠 Code task`.
 
 ### 2.4. Добавить memory/context budgeting для быстрых ответов
+
+**Статус: выполнено.** Память ранжируется по keyword overlap и ограничивается
+8 000 символов для chat и code. История диалога сохраняется самим `agy --continue`,
+а тяжёлые pinned files по-прежнему не попадают в fast chat.
 
 Файл: `bot/handlers/message.py`
 

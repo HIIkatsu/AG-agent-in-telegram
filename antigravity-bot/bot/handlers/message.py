@@ -13,7 +13,7 @@ import tempfile
 import urllib.parse
 
 from aiogram import Bot, F, Router
-from aiogram.types import FSInputFile, Message
+from aiogram.types import Message
 
 from bot.config import settings
 from bot.db import db
@@ -21,6 +21,14 @@ from bot.services.agy_runner import run_agy
 from bot.services.artifacts import collect_task_artifacts, deliver_and_cleanup_artifacts
 
 from bot.services.git_manager import git_manager
+from bot.services.execution_profiles import (
+    CHAT_MEMORY_CHAR_BUDGET,
+    CODE_MEMORY_CHAR_BUDGET,
+    classify_execution_profile,
+    effective_mode,
+    effective_web_policy,
+    select_relevant_notes,
+)
 from bot.services.tracker import TaskTracker
 from bot.services.voice import transcribe_voice
 
@@ -117,28 +125,40 @@ async def _process(
     session = await db.get_or_create_session(thread_id)
     await db.update_last_used(thread_id)
 
-    # If files were attached, add them to prompt using workspace-relative paths only.
+    session_mode = str(session.get("mode", "code"))
+    execution_profile = classify_execution_profile(text, has_attachments=bool(files))
+    mode = effective_mode(session_mode, execution_profile)
+
+    # Build a profile-aware prompt. Fast chat gets relevant bounded memory only;
+    # project paths are deliberately omitted so they do not provoke file tools.
     prompt = text
     prompt_sections: list[str] = []
     if files:
         file_list = "\n".join(f"- {f}" for f in files)
         prompt_sections.append(f"Прикрепленные файлы в рабочей директории:\n{file_list}")
 
-    context_files = await db.list_context_files(thread_id)
-    if context_files:
-        ctx = "\n".join(f"- {row['path']}" for row in context_files[:30])
-        prompt_sections.append(f"Закрепленный контекст проекта:\n{ctx}")
+    if execution_profile == "code":
+        context_files = await db.list_context_files(thread_id)
+        if context_files:
+            ctx = "\n".join(f"- {row['path']}" for row in context_files[:30])
+            prompt_sections.append(f"pinned_files:\n{ctx}")
 
     memory_notes = await db.list_memory_notes(thread_id)
     if memory_notes:
-        mem = "\n".join(f"- {row['note']}" for row in memory_notes[:20])
-        prompt_sections.append(f"Память проекта:\n{mem}")
+        budget = (
+            CHAT_MEMORY_CHAR_BUDGET
+            if execution_profile == "chat"
+            else CODE_MEMORY_CHAR_BUDGET
+        )
+        relevant_notes = select_relevant_notes(memory_notes, text, char_budget=budget)
+        if relevant_notes:
+            mem = "\n".join(f"- {note}" for note in relevant_notes)
+            prompt_sections.append(f"relevant_notes:\n{mem}")
 
     if prompt_sections:
         prompt = f"{text}\n\n[" + "\n\n".join(prompt_sections) + "]"
 
     model: str = session.get("model", "") or "Gemini 3.6 flash (high)"
-    mode: str = session.get("mode", "code")
     project_id: int = session.get("project_id", 0) or 0
     
     # Enqueue task to database
@@ -182,6 +202,7 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
             prompt = task["prompt"]
             model = task["model"]
             mode = task.get("mode", "code")
+            execution_profile = "chat" if mode == "chat" else "code"
             
             session = await db.get_session(thread_id)
             if not session:
@@ -189,7 +210,9 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 
             ws = session["workdir"]
             os.makedirs(ws, exist_ok=True)
-            web_search: str = session.get("web_search", "off")
+            from bot.modes import get_mode_config
+            mode_config = get_mode_config(mode)
+            web_search = effective_web_policy(session.get("web_search"), mode_config["web"])
 
             # Deterministic valid UUIDv5 based on thread_id
             import uuid as _uuid
@@ -201,7 +224,7 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
 
             status_msg = await bot.send_message(
                 chat_id, 
-                "<b>Агент работает...</b>\n└─ [⠋] Обработка...", 
+                f"<b>{'⚡ Chat' if execution_profile == 'chat' else '🛠 Code task'}</b>\n└─ [⠋] Обработка...",
                 parse_mode="HTML",
                 message_thread_id=thread_id
             )
@@ -212,14 +235,14 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
             tracker = TaskTracker(
                 bot, thread_id, status_msg, ws_dir=ws, 
                 commit_hash=None, task_id=task_id, 
-                model=model, mode=mode
+                model=model, mode="⚡ Chat" if execution_profile == "chat" else "🛠 Code task"
             )
             await tracker.start()
 
             import time as _time
             artifacts_started_at = _time.time()
             commit_hash: str | None = None
-            if mode != "chat":
+            if execution_profile == "code":
                 await tracker.on_tool_start("git_checkpoint", "Создаю checkpoint")
                 try:
                     commit_hash = await git_manager.create_checkpoint_async(ws, label=prompt[:25], timeout=15)
@@ -243,6 +266,7 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                     web_search=web_search,
                     model=model,
                     mode=mode,
+                    execution_profile=execution_profile,
                     thread_id=thread_id,
                 ))
                 _active_tasks[thread_id] = (tracker, agy_task)
@@ -264,12 +288,17 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
 
             # Finalize the visible answer before any artifact scanning/diff work so the
             # user does not wait on slower post-processing after the model is done.
-            try:
-                tracker.has_changes_after_finish = await git_manager.has_changes_async(ws, timeout=5)
-            except Exception:
-                tracker.has_changes_after_finish = False
+            if execution_profile == "code":
+                try:
+                    tracker.has_changes_after_finish = await git_manager.has_changes_async(ws, timeout=5)
+                except Exception:
+                    tracker.has_changes_after_finish = False
 
             await tracker.finish("TIMEOUT" if task_status == "timeout" else "ERROR" if task_status == "failed" else "CANCELLED" if task_status == "cancelled" else "DONE")
+
+            if execution_profile == "chat" or task_status == "cancelled":
+                await asyncio.sleep(0.5)
+                continue
 
             # Artifact post-tool processing: git changed files + bounded scratchpad scan.
             new_files = await collect_task_artifacts(ws, artifacts_started_at)
@@ -291,24 +320,6 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 from bot.services.tracker import rollback_registry
                 rlist = rollback_registry.setdefault(status_msg.message_id, [])
                 await deliver_and_cleanup_artifacts(bot, chat_id, synced_files, thread_id=thread_id, rollback_list=rlist)
-
-                # Auto-generate and send diff.html
-                raw_diff = await git_manager.get_diff_async(ws, timeout=5)
-                if raw_diff and raw_diff.strip():
-                    from bot.services.diff_viewer import generate_diff_html_file
-                    try:
-                        diff_file_path = generate_diff_html_file(raw_diff, f"Task {task_id}")
-                        doc = FSInputFile(diff_file_path, filename="diff.html")
-                        await bot.send_document(
-                            chat_id, 
-                            doc, 
-                            caption="👀 <b>Изменения (diff.html):</b>\nОткройте файл в браузере для просмотра.", 
-                            parse_mode="HTML", 
-                            message_thread_id=thread_id
-                        )
-                    except Exception as e:
-                        import logging
-                        logging.getLogger(__name__).warning("Failed to auto-send diff.html: %s", e)
 
             await asyncio.sleep(0.5)
             
