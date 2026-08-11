@@ -21,7 +21,12 @@ async def cq_env_manage_menu(cq: CallbackQuery, state: FSMContext) -> None:
     """Show list of environments."""
     await state.clear()
     thread_id = int(cq.data.split(":")[1])
-    
+
+    await _show_env_manage_menu(cq, thread_id)
+
+
+async def _show_env_manage_menu(cq: CallbackQuery, thread_id: int) -> None:
+    """Render the environment list without modifying the callback model."""
     envs = await db.get_all_environments()
     
     text = "🖥 <b>Управление Серверами (SSH)</b>\n\n"
@@ -68,9 +73,7 @@ async def cq_env_del(cq: CallbackQuery) -> None:
     await db.delete_environment(int(env_id_str))
     await cq.answer("Сервер удален!")
     
-    # Reload menu
-    cq.data = f"env_manage_menu:{thread_id_str}"
-    await cq_env_manage_menu(cq, None) # type: ignore
+    await _show_env_manage_menu(cq, int(thread_id_str))
 
 @router.callback_query(F.data.startswith("env_add:"))
 async def cq_env_add(cq: CallbackQuery, state: FSMContext) -> None:

@@ -63,7 +63,12 @@ async def cb_set_menu(cq: CallbackQuery) -> None:
     parts = cq.data.split(":")
     menu = parts[1]
     thread_id = int(parts[2])
-    
+
+    await _show_settings_menu(cq, menu, thread_id)
+
+
+async def _show_settings_menu(cq: CallbackQuery, menu: str, thread_id: int) -> None:
+    """Render a settings submenu without modifying the callback model."""
     session = await db.get_or_create_session(thread_id)
     
     if menu == "model":
@@ -143,6 +148,6 @@ async def cb_set_val(cq: CallbackQuery) -> None:
 
     await cq.answer("Настройка сохранена!")
     
-    # Refresh menu
-    cq.data = f"set_menu:{menu}:{thread_id}"
-    await cb_set_menu(cq)
+    # Refresh the selected menu. CallbackQuery is a frozen Pydantic model in
+    # aiogram 3, so pass the parsed values explicitly instead of rewriting data.
+    await _show_settings_menu(cq, menu, thread_id)

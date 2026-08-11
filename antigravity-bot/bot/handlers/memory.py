@@ -13,7 +13,12 @@ async def cq_mem_show(cq: CallbackQuery) -> None:
     """Callback to show memory from dashboard."""
     _, thread_id_str = cq.data.split(":", 1)
     thread_id = int(thread_id_str) if thread_id_str != "0" else None
-    
+
+    await _show_memory(cq, thread_id)
+
+
+async def _show_memory(cq: CallbackQuery, thread_id: int | None) -> None:
+    """Render memory without modifying the callback model."""
     facts = await db.get_all_user_memory()
     if not facts:
         text = "📭 <b>Глобальная память пуста</b>\n\nАгент пока не сохранил никаких фактов."
@@ -72,7 +77,4 @@ async def cq_mem_del(cq: CallbackQuery) -> None:
     await db.delete_user_memory(fact_id)
     await cq.answer("Факт удален из памяти.")
     
-    # Refresh view
-    # Redirect back to show
-    cq.data = f"mem_show:{thread_id or 0}"
-    await cq_mem_show(cq)
+    await _show_memory(cq, thread_id)
