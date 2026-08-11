@@ -6,7 +6,7 @@ Telegram bot integration for **Antigravity CLI** agent execution, featuring mult
 
 - 🤖 **Antigravity CLI Integration**: Run agent sessions via native `agy` CLI with stream-json output.
 - 💬 **Forum Topics & Thread Isolation**: Each Telegram thread maps to an isolated workspace with project session persistence.
-- 🎤 **Voice Support**: Instant voice message transcription via `faster-whisper`.
+- 🎤 **Voice Support**: Instant voice message transcription via cloud STT (Groq with Wit.ai fallback).
 - 🔄 **Git Checkpoints & Rollback**: Automatic workspace checkpoints before tasks with side-by-side diff viewing and one-click rollback.
 - 🛡️ **Native Rules**: Uses `.agents/AGENTS.md` rules for agent behavior control.
 - 🚀 **One-Click Deploy**: Automated SSH deployment script for Linux VPS.
