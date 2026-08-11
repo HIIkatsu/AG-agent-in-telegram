@@ -25,12 +25,12 @@ async def build_dashboard_content(thread_id: int) -> tuple[str, InlineKeyboardMa
     project_name = os.path.basename(ws)
     if not os.path.exists(ws):
         os.makedirs(ws, exist_ok=True)
-        git_manager.init_workspace(ws)
+        await git_manager.init_workspace_async(ws)
 
     # Git stats
-    branch = git_manager.get_current_branch(ws) or "N/A"
+    branch = await git_manager.get_current_branch_async(ws) or "N/A"
     try:
-        changed_files_count = len(git_manager.status(ws))
+        changed_files_count = len(await git_manager.status_async(ws))
     except Exception:
         changed_files_count = 0
 

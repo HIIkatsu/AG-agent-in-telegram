@@ -156,3 +156,84 @@ async def deliver_and_cleanup_artifacts(
             except Exception as e:
                 logger.warning("Failed to remove scratch file %s: %s", fpath, e)
 
+
+_IGNORE_DIRS = {
+    ".git", "node_modules", ".venv", "venv", "dist", "build", ".cache",
+    "__pycache__", ".agents", ".antigravity", "vendor", "target",
+}
+
+
+def _is_ignored_dir(path: Path) -> bool:
+    return path.name in _IGNORE_DIRS or path.name.startswith(".") and path.name not in {"."}
+
+
+def _collect_recent_scratch_files_sync(
+    started_at: float,
+    max_depth: int = 3,
+    max_files: int = 200,
+    deadline_seconds: float = 2.0,
+) -> list[str]:
+    """Collect recent scratchpad artifacts with tight depth/count/time limits."""
+    import time
+
+    deadline = time.monotonic() + deadline_seconds
+    found: list[str] = []
+    stack: list[tuple[Path, int]] = [(Path(d), 0) for d in _DEFAULT_SCRATCH_DIRS]
+
+    while stack and len(found) < max_files and time.monotonic() < deadline:
+        root, depth = stack.pop()
+        if not root.is_dir():
+            continue
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if len(found) >= max_files or time.monotonic() >= deadline:
+                break
+            try:
+                if entry.is_dir():
+                    if depth < max_depth and not _is_ignored_dir(entry):
+                        stack.append((entry, depth + 1))
+                    continue
+                if entry.suffix.lower() not in _TRACK_EXT:
+                    continue
+                if entry.stat().st_mtime >= started_at:
+                    found.append(str(entry.resolve()))
+            except OSError:
+                continue
+    return found
+
+
+async def collect_task_artifacts(ws_dir: str, started_at: float) -> list[str]:
+    """Collect task artifacts without full workspace os.walk on the event loop.
+
+    Workspace changes come from git status; scratchpad is scanned in a bounded
+    worker-thread pass by mtime/depth/count/time limits.
+    """
+    import asyncio
+
+    from bot.services.git_manager import GitCommandTimeout, git_manager
+
+    workspace_files: list[str] = []
+    try:
+        workspace_files = await git_manager.changed_files_async(ws_dir, timeout=5)
+    except (GitCommandTimeout, TimeoutError):
+        logger.warning("Git changed-files collection timed out for %s", ws_dir)
+    except Exception:
+        logger.exception("Failed to collect git changed files for %s", ws_dir)
+
+    try:
+        scratch_files = await asyncio.to_thread(_collect_recent_scratch_files_sync, started_at)
+    except Exception:
+        logger.exception("Failed to collect scratch artifacts")
+        scratch_files = []
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for fpath in workspace_files + scratch_files:
+        name = os.path.basename(fpath)
+        if name not in seen:
+            seen.add(name)
+            deduped.append(fpath)
+    return deduped

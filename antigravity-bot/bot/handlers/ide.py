@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import html
-import subprocess
 from pathlib import Path
 
 from aiogram import Bot, F, Router
@@ -157,11 +156,23 @@ async def cmd_search(message: Message, command: CommandObject) -> None:
     ws = session["workdir"]
     cmd = ["rg", "--line-number", "--column", "--hidden", "--glob", "!{.git,node_modules,.venv,venv,dist,build,.cache,__pycache__,.agents}/**", "--", query, "."]
     try:
-        res = subprocess.run(cmd, cwd=ws, capture_output=True, text=True, timeout=20)
-    except subprocess.TimeoutExpired:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=ws,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        async with asyncio.timeout(20):
+            stdout, _stderr = await proc.communicate()
+    except TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
         await message.answer("🔍 Поиск остановлен по timeout 20s.")
         return
-    output = res.stdout.strip()
+    output = stdout.decode("utf-8", errors="ignore").strip()
     if not output:
         await message.answer("🔍 Ничего не найдено.")
         return
@@ -247,7 +258,7 @@ async def cmd_diff(message: Message, bot: Bot) -> None:
         return
     session = await db.get_or_create_session(thread_id)
     ws = session["workdir"]
-    status = git_manager.status(ws)
+    status = await git_manager.status_async(ws)
     if not status:
         await message.answer("✅ Изменений нет.")
         return
@@ -351,7 +362,7 @@ async def cb_diff_patch(cq: CallbackQuery, bot: Bot) -> None:
     if not session:
         await cq.answer("Сессия не найдена", show_alert=True)
         return
-    raw_diff = git_manager.get_diff(session["workdir"])
+    raw_diff = await git_manager.get_diff_async(session["workdir"])
     if not raw_diff.strip():
         await cq.answer("Изменений нет", show_alert=True)
         return
@@ -412,7 +423,7 @@ async def cb_open_diff(cq: CallbackQuery) -> None:
     if not session:
         await cq.answer("Сессия не найдена", show_alert=True)
         return
-    status = git_manager.status(session["workdir"])
+    status = await git_manager.status_async(session["workdir"])
     if not status:
         await cq.answer("Изменений нет", show_alert=True)
         return

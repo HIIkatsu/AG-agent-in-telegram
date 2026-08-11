@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     # Timeouts
     task_timeout_seconds: int = 600
     agy_print_timeout: str = "10m0s"
+    permissions_mode: str = "skip"  # skip, ask, deny-dangerous
+    dangerously_skip_permissions: bool = True
 
     @property
     def allowed_ids(self) -> list[int]:

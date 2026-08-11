@@ -18,11 +18,7 @@ from aiogram.types import FSInputFile, Message
 from bot.config import settings
 from bot.db import db
 from bot.services.agy_runner import run_agy
-from bot.services.artifacts import (
-    deliver_and_cleanup_artifacts,
-    diff_snapshots,
-    snapshot_workspaces,
-)
+from bot.services.artifacts import collect_task_artifacts, deliver_and_cleanup_artifacts
 
 from bot.services.git_manager import git_manager
 from bot.services.tracker import TaskTracker
@@ -200,9 +196,6 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
             _NAMESPACE_TG = _uuid.UUID('6ba7b810-9ed0-11d1-80b4-00c04fd430c8')
             conversation_id = str(_uuid.uuid5(_NAMESPACE_TG, f"thread-{thread_id}"))
 
-            # Ensure git checkpoint is created before task execution
-            commit_hash = git_manager.create_checkpoint(ws, label=prompt[:25])
-
             stop_typing = asyncio.Event()
             typing_task = asyncio.create_task(_typing_loop(bot, chat_id, stop_typing, thread_id))
 
@@ -218,13 +211,24 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
             
             tracker = TaskTracker(
                 bot, thread_id, status_msg, ws_dir=ws, 
-                commit_hash=commit_hash, task_id=task_id, 
+                commit_hash=None, task_id=task_id, 
                 model=model, mode=mode
             )
             await tracker.start()
 
-            # Take snapshot of both workspace and agy scratchpad
-            snap_before = snapshot_workspaces([ws])
+            import time as _time
+            artifacts_started_at = _time.time()
+            commit_hash: str | None = None
+            if mode != "chat":
+                await tracker.on_tool_start("git_checkpoint", "Создаю checkpoint")
+                try:
+                    commit_hash = await git_manager.create_checkpoint_async(ws, label=prompt[:25], timeout=15)
+                    tracker.commit_hash = commit_hash
+                    await tracker.on_tool_end("git_checkpoint", "DONE")
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).warning("Git checkpoint unavailable for %s", ws, exc_info=True)
+                    await tracker.on_tool_end("git_checkpoint", "ERROR")
             agy_task: asyncio.Task | None = None
 
             try:
@@ -258,9 +262,8 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 typing_task.cancel()
                 _active_tasks.pop(thread_id, None)
 
-            # Artifact post-tool processing across workspace + scratchpad
-            snap_after = snapshot_workspaces([ws])
-            new_files = diff_snapshots(snap_before, snap_after)
+            # Artifact post-tool processing: git changed files + bounded scratchpad scan.
+            new_files = await collect_task_artifacts(ws, artifacts_started_at)
 
             import shutil
             synced_files: list[str] = []
@@ -275,6 +278,11 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 else:
                     synced_files.append(fpath)
 
+            try:
+                tracker.has_changes_after_finish = await git_manager.has_changes_async(ws, timeout=5)
+            except Exception:
+                tracker.has_changes_after_finish = False
+
             await tracker.finish("TIMEOUT" if task_status == "timeout" else "ERROR" if task_status == "failed" else "CANCELLED" if task_status == "cancelled" else "DONE")
 
             if synced_files:
@@ -283,7 +291,7 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 await deliver_and_cleanup_artifacts(bot, chat_id, synced_files, thread_id=thread_id, rollback_list=rlist)
 
                 # Auto-generate and send diff.html
-                raw_diff = git_manager.get_diff(ws)
+                raw_diff = await git_manager.get_diff_async(ws, timeout=5)
                 if raw_diff and raw_diff.strip():
                     from bot.services.diff_viewer import generate_diff_html_file
                     try:

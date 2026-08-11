@@ -119,10 +119,14 @@ async def run_agy(
         "--project", conversation_id,
         "--continue",
         "--add-dir", workspace_dir,
-        "--dangerously-skip-permissions",
         "--output-format", "stream-json",
         "--print-timeout", settings.agy_print_timeout,
     ]
+
+    if settings.dangerously_skip_permissions:
+        cmd.append("--dangerously-skip-permissions")
+        if settings.permissions_mode == "ask":
+            logger.warning("dangerously_skip_permissions=True conflicts with permissions_mode=ask; skipping HITL permissions")
 
     # Model passed as exact CLI string name, e.g. "Claude Sonnet 4.6 (Thinking)"
     if model:
@@ -225,19 +229,24 @@ async def run_agy(
                                 if tracker:
                                     await tracker.on_tool_start(tool_name, label)
 
-                                approved = await permission_handler.handle_permission(
-                                    bot=bot,
-                                    chat_id=chat_id,
-                                    tool_name=tool_name,
-                                    parameters=params,
-                                    proc=proc,
-                                    thread_id=thread_id,
+                                should_ask_permission = (
+                                    settings.permissions_mode == "ask"
+                                    and not settings.dangerously_skip_permissions
                                 )
-                                if not approved:
-                                    logger.warning("Tool execution denied by user: %s", tool_name)
-                                    if tracker:
-                                        await tracker.on_tool_end(tool_name, "DENIED")
-                                    return full_response + "\n\n❌ Действие отклонено пользователем."
+                                if should_ask_permission:
+                                    approved = await permission_handler.handle_permission(
+                                        bot=bot,
+                                        chat_id=chat_id,
+                                        tool_name=tool_name,
+                                        parameters=params,
+                                        proc=proc,
+                                        thread_id=thread_id,
+                                    )
+                                    if not approved:
+                                        logger.warning("Tool execution denied by user: %s", tool_name)
+                                        if tracker:
+                                            await tracker.on_tool_end(tool_name, "DENIED")
+                                        return full_response + "\n\n❌ Действие отклонено пользователем."
 
                             elif state in ("DONE", "ERROR"):
                                 if tracker:
