@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 
+import uvloop
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import BotCommand
@@ -146,4 +147,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    uvloop.install()
     asyncio.run(main())

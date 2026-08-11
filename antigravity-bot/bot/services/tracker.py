@@ -76,7 +76,7 @@ class TaskTracker:
         self.thread_id = thread_id
         self.status_msg = status_message
         self.ws_dir = ws_dir
-        self.debounce = max(debounce, 1.5)
+        self.debounce = max(debounce, 0.8)
         self.commit_hash = commit_hash
         self.task_id = task_id
         self.model = model
@@ -97,6 +97,7 @@ class TaskTracker:
         self._render_task: asyncio.Task | None = None
         self.has_changes_after_finish = False
         self._pending_log_events: list[tuple[str, str, str | None]] = []
+        self._background_tasks: set[asyncio.Task] = set()
 
     @property
     def cancelled(self) -> bool:
@@ -157,7 +158,7 @@ class TaskTracker:
                 await self._render_task
             except asyncio.CancelledError:
                 pass
-        await self._flush_log_events()
+        self._schedule_log_flush()
         await self.render(force=True, final=True)
 
     async def _render_loop(self) -> None:
@@ -263,7 +264,7 @@ class TaskTracker:
                 except Exception as e:
                     logger.debug("Render final simple reply error: %s", e)
                 
-                rollback_registry[self.status_msg.message_id] = sent_msg_ids
+                rollback_registry.setdefault(self.status_msg.message_id, []).extend(sent_msg_ids)
                 if self.thread_id is not None:
                     thread_messages_registry.setdefault(self.thread_id, []).extend(sent_msg_ids)
                 return
@@ -280,7 +281,6 @@ class TaskTracker:
                 try:
                     chunks = chunk_text(clean_text, max_len=4000)
                     if len(clean_text) > 12000:
-                        import tempfile
                         reply_id = self.status_msg.reply_to_message.message_id if self.status_msg.reply_to_message else None
                         msg1 = await self.bot.send_message(
                             chat_id=self.status_msg.chat.id,
@@ -290,19 +290,10 @@ class TaskTracker:
                             reply_to_message_id=reply_id
                         )
                         sent_msg_ids.append(msg1.message_id)
-                        
-                        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".md", prefix="response_")
-                        try:
-                            with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
-                                f.write(buffer_copy.strip())
-                            msg2 = await self.bot.send_document(
-                                self.status_msg.chat.id, 
-                                FSInputFile(tmp_path, filename="full_response.md"),
-                                message_thread_id=self.thread_id if self.thread_id else None
-                            )
-                            sent_msg_ids.append(msg2.message_id)
-                        finally:
-                            os.remove(tmp_path)
+                        self._schedule_background_task(
+                            self._send_full_response_document(buffer_copy.strip()),
+                            label="send_full_response_document",
+                        )
                     else:
                         reply_id = self.status_msg.reply_to_message.message_id if self.status_msg.reply_to_message else None
                         for i, chunk in enumerate(chunks):
@@ -319,7 +310,7 @@ class TaskTracker:
                 except Exception as e:
                     logger.debug("Render final reply error: %s", e)
             
-            rollback_registry[self.status_msg.message_id] = sent_msg_ids
+            rollback_registry.setdefault(self.status_msg.message_id, []).extend(sent_msg_ids)
             if self.thread_id is not None:
                 thread_messages_registry.setdefault(self.thread_id, []).extend(sent_msg_ids)
             return
@@ -354,6 +345,25 @@ class TaskTracker:
         from bot.services.task_service import log_task_events_bulk
         await log_task_events_bulk(self.task_id, events)
 
+    def _schedule_background_task(self, coro, *, label: str) -> None:
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+
+        def _done_callback(done_task: asyncio.Task) -> None:
+            self._background_tasks.discard(done_task)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.debug("Background tracker task %s failed: %s", label, exc)
+
+        task.add_done_callback(_done_callback)
+
+    def _schedule_log_flush(self) -> None:
+        if self.task_id and self._pending_log_events:
+            self._schedule_background_task(self._flush_log_events(), label="log_flush")
+
     async def _safe_edit(self, msg: Message, html_text: str, reply_markup: InlineKeyboardMarkup | None = None, final: bool = False, force: bool = False) -> None:
         from bot.services.telegram_rate_limiter import telegram_rate_limiter
         if not await telegram_rate_limiter.allow_edit(msg.chat.id, msg.message_id, final=final, force=force):
@@ -382,7 +392,7 @@ class TaskTracker:
                     pass
 
     async def _extract_large_code_blocks(self, text: str) -> str:
-        """Extract code blocks > 1500 chars or > 50 lines to files and send to Telegram."""
+        """Extract large code blocks to files and schedule Telegram delivery in background."""
         pattern = re.compile(r"```([a-zA-Z0-9_\-\+]*)\n(.*?)```", re.DOTALL)
         matches = list(pattern.finditer(text))
         
@@ -401,6 +411,7 @@ class TaskTracker:
         offset = 0
         result = []
         snippets_count = 0
+        snippets_to_send: list[tuple[str, str]] = []
         
         for m in matches:
             lang = m.group(1).strip().lower()
@@ -413,17 +424,8 @@ class TaskTracker:
                 filename = f"snippet_{snippets_count}{ext}"
                 file_path = os.path.join(self.ws_dir, filename)
                 
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(code)
-                
-                try:
-                    await self.bot.send_document(
-                        self.status_msg.chat.id,
-                        FSInputFile(file_path, filename=filename),
-                        message_thread_id=self.thread_id if self.thread_id else None
-                    )
-                except Exception as e:
-                    logger.error("Failed to send snippet %s: %s", filename, e)
+                await asyncio.to_thread(self._write_text_file, file_path, code)
+                snippets_to_send.append((file_path, filename))
                 
                 placeholder = f"📄 [Сгенерирован файл: {filename} | {lines_count} строк]"
                 
@@ -435,4 +437,57 @@ class TaskTracker:
                 offset = m.end()
                 
         result.append(text[offset:])
+        if snippets_to_send:
+            self._schedule_background_task(
+                self._send_snippet_documents(snippets_to_send),
+                label="send_snippet_documents",
+            )
         return "".join(result)
+
+    @staticmethod
+    def _write_text_file(file_path: str, content: str) -> None:
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    async def _send_snippet_documents(self, snippets: list[tuple[str, str]]) -> None:
+        sent_msg_ids = []
+        for file_path, filename in snippets:
+            try:
+                msg = await self.bot.send_document(
+                    self.status_msg.chat.id,
+                    FSInputFile(file_path, filename=filename),
+                    message_thread_id=self.thread_id if self.thread_id else None,
+                )
+                sent_msg_ids.append(msg.message_id)
+            except Exception as e:
+                logger.error("Failed to send snippet %s: %s", filename, e)
+
+        if sent_msg_ids:
+            rollback_registry.setdefault(self.status_msg.message_id, []).extend(sent_msg_ids)
+            if self.thread_id is not None:
+                thread_messages_registry.setdefault(self.thread_id, []).extend(sent_msg_ids)
+
+    async def _send_full_response_document(self, content: str) -> None:
+        import tempfile
+
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".md", prefix="response_")
+        try:
+            await asyncio.to_thread(self._write_fd_text_file, tmp_fd, content)
+            msg = await self.bot.send_document(
+                self.status_msg.chat.id,
+                FSInputFile(tmp_path, filename="full_response.md"),
+                message_thread_id=self.thread_id if self.thread_id else None,
+            )
+            rollback_registry.setdefault(self.status_msg.message_id, []).append(msg.message_id)
+            if self.thread_id is not None:
+                thread_messages_registry.setdefault(self.thread_id, []).append(msg.message_id)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _write_fd_text_file(fd: int, content: str) -> None:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
