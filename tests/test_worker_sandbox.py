@@ -234,3 +234,21 @@ def test_production_worker_identity_cannot_be_root(monkeypatch: pytest.MonkeyPat
 
     with pytest.raises(worker_sandbox.WorkerSandboxError, match="non-root"):
         worker_sandbox._worker_ids()
+
+
+def test_bubblewrap_probe_includes_the_dynamic_loader_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "agy_sandbox_binary", "/usr/bin/true")
+    monkeypatch.setattr(settings, "agy_worker_uid", 999)
+    monkeypatch.setattr(settings, "agy_worker_gid", 988)
+
+    command = worker_sandbox._bubblewrap_probe_command()
+
+    assert command[:3] == ["/usr/bin/true", "--die-with-parent", "--new-session"]
+    assert "--clearenv" in command
+    assert _ro_bind_index(command, "/usr", "/usr")
+    assert _ro_bind_index(command, "/bin", "/bin")
+    assert _ro_bind_index(command, "/lib", "/lib")
+    assert _ro_bind_index(command, "/lib64", "/lib64")
+    assert command[-2:] == ["--", "/usr/bin/true"]
