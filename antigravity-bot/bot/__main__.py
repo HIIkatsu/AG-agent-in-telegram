@@ -32,6 +32,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _configure_native_memory_tools() -> bool:
+    """Register native memory tools without making the bot unavailable."""
+    from pathlib import Path
+
+    from bot.services.instructions import BOT_ROOT
+    from bot.services.memory_mcp_config import (
+        MemoryMcpConfigError,
+        ensure_memory_mcp_config,
+    )
+
+    try:
+        memory_mcp_report = ensure_memory_mcp_config(
+            config_path=Path(settings.agy_mcp_config_path),
+            python_executable=Path(sys.executable),
+            bot_root=BOT_ROOT,
+            db_path=settings.db_path,
+        )
+    except MemoryMcpConfigError as exc:
+        logger.warning(
+            "AGY native memory tools unavailable; bot will continue without them: %s",
+            exc,
+        )
+        return False
+
+    logger.info(
+        "AGY native memory tools ready: state=%s config=%s",
+        memory_mcp_report.state,
+        memory_mcp_report.config_path,
+    )
+    return True
+
+
 def check_startup() -> None:
     """Validate environment before starting."""
     import shutil
@@ -71,30 +104,9 @@ def check_startup() -> None:
         len(skill_report.removed),
     )
 
-    # Register the bot-owned native memory tools in AGY's global MCP config.
-    # The merger preserves unrelated MCP servers and refuses to overwrite a
-    # conflicting server with the same name.
-    from bot.services.instructions import BOT_ROOT
-    from bot.services.memory_mcp_config import (
-        MemoryMcpConfigError,
-        ensure_memory_mcp_config,
-    )
-
-    try:
-        memory_mcp_report = ensure_memory_mcp_config(
-            config_path=Path(settings.agy_mcp_config_path),
-            python_executable=Path(sys.executable),
-            bot_root=BOT_ROOT,
-            db_path=settings.db_path,
-        )
-    except MemoryMcpConfigError as exc:
-        logger.error("Cannot configure AGY native memory tools: %s", exc)
-        sys.exit(1)
-    logger.info(
-        "AGY native memory tools ready: state=%s config=%s",
-        memory_mcp_report.state,
-        memory_mcp_report.config_path,
-    )
+    # This integration is optional: an invalid third-party MCP config must not
+    # take down the Telegram bot or risk being overwritten during startup.
+    _configure_native_memory_tools()
 
     # Check source and isolated task workspace roots.
     for workspace_root in (settings.workspaces_dir, settings.task_workspaces_dir):
