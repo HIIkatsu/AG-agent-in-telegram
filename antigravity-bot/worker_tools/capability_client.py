@@ -18,8 +18,8 @@ from typing import Any
 _MAX_REQUEST_BYTES = 16 * 1024
 _MAX_RESPONSE_BYTES = 64 * 1024
 _SOCKET_TIMEOUT_SECONDS = 180
-_SERVER_NAME = "ag-telegram-memory"
-_SERVER_VERSION = "1.0.0"
+_SERVER_NAME = "ag-telegram-capabilities"
+_SERVER_VERSION = "1.1.0"
 _DEFAULT_PROTOCOL_VERSION = "2025-06-18"
 
 
@@ -141,6 +141,31 @@ _MEMORY_TOOLS: list[dict[str, object]] = [
     },
 ]
 
+_IMAGE_TOOLS: list[dict[str, object]] = [
+    {
+        "name": "mistral_generate_image",
+        "description": (
+            "Generate one image through the configured Mistral image service. "
+            "Use only when the user explicitly asks for an image. The result is "
+            "saved directly to this task's Telegram artifact output; do not copy "
+            "it, inspect host paths, or use the built-in generate_image tool."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Complete visual description for the requested image",
+                }
+            },
+            "required": ["prompt"],
+            "additionalProperties": False,
+        },
+    }
+]
+
+_CAPABILITY_TOOLS = [*_MEMORY_TOOLS, *_IMAGE_TOOLS]
+
 
 def _success(request_id: object, result: dict[str, object]) -> dict[str, object]:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
@@ -161,7 +186,7 @@ def _tool_result(payload: dict[str, object], *, is_error: bool = False) -> dict[
     }
 
 
-def _memory_tool_result(params: Mapping[str, object]) -> dict[str, object]:
+def _capability_tool_result(params: Mapping[str, object]) -> dict[str, object]:
     name = params.get("name")
     arguments = params.get("arguments", {})
     if not isinstance(arguments, Mapping):
@@ -170,6 +195,7 @@ def _memory_tool_result(params: Mapping[str, object]) -> dict[str, object]:
         "save_memory": "memory.save",
         "list_memory": "memory.list",
         "delete_memory": "memory.delete",
+        "mistral_generate_image": "image.generate",
     }
     action = actions.get(name) if isinstance(name, str) else None
     if action is None:
@@ -204,9 +230,9 @@ def handle_memory_request(request: Mapping[str, object]) -> dict[str, object] | 
             },
         )
     if method == "tools/list":
-        return _success(request_id, {"tools": _MEMORY_TOOLS})
+        return _success(request_id, {"tools": _CAPABILITY_TOOLS})
     if method == "tools/call":
-        return _success(request_id, _memory_tool_result(params))
+        return _success(request_id, _capability_tool_result(params))
     if method == "ping":
         return _success(request_id, {})
     if request_id is None:

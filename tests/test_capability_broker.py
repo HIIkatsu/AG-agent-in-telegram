@@ -192,3 +192,48 @@ def test_ssh_capability_cannot_execute_after_denial(
         )
 
     execute.assert_not_awaited()
+
+
+def test_image_capability_writes_only_to_the_current_task_artifact_directory(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, Path]] = []
+
+    async def fake_image_generator(
+        prompt: str,
+        artifact_dir: str | Path,
+    ) -> dict[str, object]:
+        calls.append((prompt, Path(artifact_dir)))
+        return {
+            "status": "saved_for_telegram",
+            "files": ["mistral-image-1.png"],
+            "count": 1,
+        }
+
+    broker = capability_broker.TaskCapabilityBroker(
+        bot=SimpleNamespace(),
+        chat_id=1,
+        thread_id=77,
+        task_id=91,
+        worker_uid=os.geteuid(),
+        worker_gid=os.getegid(),
+        artifact_dir=tmp_path,
+        image_generator=fake_image_generator,
+    )
+
+    result = asyncio.run(
+        broker._dispatch(
+            {
+                "token": broker._token,
+                "action": "image.generate",
+                "arguments": {"prompt": "Ночной город в стиле киберпанк"},
+            }
+        )
+    )
+
+    assert result == {
+        "status": "saved_for_telegram",
+        "files": ["mistral-image-1.png"],
+        "count": 1,
+    }
+    assert calls == [("Ночной город в стиле киберпанк", tmp_path)]

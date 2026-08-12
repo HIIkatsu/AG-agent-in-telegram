@@ -48,6 +48,14 @@ class Settings(BaseSettings):
     task_artifacts_dir: str = "/tmp/antigravity-task-artifacts"
     artifact_max_files: int = 20
     artifact_max_size_mb: int = 45
+    # Mistral image generation runs in the trusted bot process through the
+    # task-scoped capability broker.  The API key is deliberately never passed
+    # into the AGY sandbox.
+    mistral_api_key: str | None = None
+    mistral_image_api_url: str = "https://api.mistral.ai/v1/chat/completions"
+    mistral_image_model: str = "mistral-small-latest"
+    mistral_image_download_hosts: str = "files.mistral.ai,api.mistral.ai"
+    mistral_image_timeout_seconds: int = 180
     db_path: str = "/opt/antigravity-bot/data/bot.db"
     log_level: str = "INFO"
     config_json_path: str = "/opt/antigravity-bot/config.json"
