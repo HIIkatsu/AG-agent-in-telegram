@@ -49,6 +49,42 @@ def test_worker_memory_mcp_routes_to_broker_without_bot_imports(monkeypatch) -> 
     assert "AGY_BOT_DB_PATH" not in source
 
 
+def test_worker_mistral_tool_routes_only_a_structured_image_request(monkeypatch) -> None:
+    client = _load_client_module()
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def fake_call(action: str, arguments: dict[str, object]) -> dict[str, object]:
+        calls.append((action, dict(arguments)))
+        return {
+            "status": "saved_for_telegram",
+            "files": ["mistral-image-1.png"],
+            "count": 1,
+        }
+
+    monkeypatch.setattr(client, "broker_call", fake_call)
+    listed = client.handle_memory_request(
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+    )
+    response = client.handle_memory_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "mistral_generate_image",
+                "arguments": {"prompt": "Летающий город"},
+            },
+        }
+    )
+
+    assert listed is not None
+    tool_names = {tool["name"] for tool in listed["result"]["tools"]}
+    assert "mistral_generate_image" in tool_names
+    assert response is not None
+    assert response["result"]["isError"] is False
+    assert calls == [("image.generate", {"prompt": "Летающий город"})]
+
+
 def test_worker_ag_ssh_client_only_submits_a_structured_broker_request(
     monkeypatch, capsys
 ) -> None:

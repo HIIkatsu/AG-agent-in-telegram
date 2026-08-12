@@ -655,11 +655,16 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
             # directory allocated to this task; it never scans a shared CLI
             # scratch folder.
             artifact_cleanup_safe = True
+            task_artifacts = None
+            await tracker.on_tool_start(
+                "artifact_inspection",
+                "Проверяю итоговые файлы",
+            )
             try:
                 task_artifacts = await collect_task_artifacts(task_id)
             except ArtifactError as exc:
                 artifact_cleanup_safe = False
-                task_artifacts = None
+                await tracker.on_tool_end("artifact_inspection", "ERROR")
                 logger.exception("Failed to collect task artifacts for task #%s", task_id)
                 if target_status == TaskStatus.DONE and is_explicit_artifact_request(prompt):
                     target_status = TaskStatus.FAILED
@@ -669,6 +674,8 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                         "результат не считается созданным."
                     )
                     await tracker.replace_text(full_response)
+            else:
+                await tracker.on_tool_end("artifact_inspection", "DONE")
 
             if target_status == TaskStatus.DONE:
                 artifact_failure = validate_requested_artifacts(prompt, task_artifacts)
@@ -677,6 +684,56 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                     terminal_error = "Requested Telegram deliverable was not produced"
                     full_response = artifact_failure
                     await tracker.replace_text(full_response)
+
+            # The output directory is task-scoped and otherwise empty by
+            # contract. Deliver every verified file it contains rather than
+            # trying to infer a user's intent from Russian word morphology.
+            # The previous regex gate silently dropped real index.html and
+            # image files for valid requests such as "сделать" or "скинуть".
+            if (
+                task_artifacts is not None
+                and task_artifacts.files
+                and target_status == TaskStatus.DONE
+            ):
+                from bot.services.tracker import rollback_registry
+
+                await tracker.on_tool_start(
+                    "artifact_delivery",
+                    f"Отправляю в Telegram: {len(task_artifacts.files)} файл(а)",
+                )
+                rlist = (
+                    rollback_registry.setdefault(status_msg.message_id, [])
+                    if status_msg is not None
+                    else None
+                )
+                report = await deliver_task_artifacts(
+                    bot,
+                    chat_id,
+                    task_artifacts,
+                    thread_id=thread_id,
+                    rollback_list=rlist,
+                )
+                if report.failed or task_artifacts.skipped:
+                    artifact_cleanup_safe = False
+                    target_status = TaskStatus.FAILED
+                    terminal_error = "Telegram artifact delivery failed"
+                    full_response = (
+                        full_response.rstrip()
+                        + "\n\n⚠️ Итоговый файл создан, но Telegram не подтвердил "
+                        "его отправку. Он сохранён на сервере; задача отмечена "
+                        "ошибкой, чтобы её можно было безопасно повторить."
+                    )
+                    await tracker.replace_text(full_response)
+                    await tracker.on_tool_end("artifact_delivery", "ERROR")
+                    logger.warning(
+                        "Task artifact delivery incomplete for task #%s: delivered=%d failed=%d skipped=%d",
+                        task_id,
+                        report.delivered,
+                        report.failed,
+                        len(task_artifacts.skipped),
+                    )
+                else:
+                    await tracker.on_tool_end("artifact_delivery", "DONE")
 
             task_status = (
                 await finish_task(
@@ -701,45 +758,6 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                     await log_task_event(task_id, "error", "Could not render task diff", str(exc))
 
             await tracker.finish(_tracker_finish_status(task_status))
-
-            if (
-                task_artifacts is not None
-                and TaskStatus.parse(task_status) == TaskStatus.DONE
-                and is_explicit_artifact_request(prompt)
-            ):
-                from bot.services.tracker import rollback_registry
-
-                rlist = (
-                    rollback_registry.setdefault(status_msg.message_id, [])
-                    if status_msg is not None
-                    else None
-                )
-                report = await deliver_task_artifacts(
-                    bot,
-                    chat_id,
-                    task_artifacts,
-                    thread_id=thread_id,
-                    rollback_list=rlist,
-                )
-                if report.failed or task_artifacts.skipped:
-                    artifact_cleanup_safe = False
-                    logger.warning(
-                        "Task artifact delivery incomplete for task #%s: delivered=%d failed=%d skipped=%d",
-                        task_id,
-                        report.delivered,
-                        report.failed,
-                        len(task_artifacts.skipped),
-                    )
-                    notice = await _safe_bot_send_message(
-                        bot,
-                        chat_id,
-                        "⚠️ Не все созданные файлы удалось отправить. "
-                        "Они сохранены на сервере для безопасной проверки.",
-                        label=f"task #{task_id} incomplete artifact notice",
-                        message_thread_id=thread_id,
-                    )
-                    if rlist is not None and notice is not None:
-                        rlist.append(notice.message_id)
 
             if artifact_cleanup_safe:
                 try:

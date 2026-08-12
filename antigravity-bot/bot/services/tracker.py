@@ -234,7 +234,10 @@ class TaskTracker:
                 step_lines.append(f"{prefix} [{icon}] {step.label}")
 
             if not final:
-                step_lines.append("└─ [⏳] Оформление ответа...")
+                # This heartbeat is intentionally animated. A model can spend
+                # several seconds composing its response after the last tool
+                # finished; a static line looks like a frozen Telegram task.
+                step_lines.append(f"└─ [{spinner}] Формирую и отправляю итог...")
             elif steps_copy:
                 step_lines[-1] = step_lines[-1].replace("├─", "└─")
 

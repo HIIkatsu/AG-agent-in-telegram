@@ -23,6 +23,7 @@ from aiogram import Bot
 
 from bot.config import settings
 from bot.services import memory_mcp
+from bot.services.mistral_images import MistralImageError, generate_mistral_image
 from bot.services.permissions import permission_handler
 from bot.services.ssh_executor import execute_command, get_public_key
 
@@ -32,6 +33,7 @@ _MAX_REQUEST_BYTES = 16 * 1024
 _MAX_COMMAND_CHARS = 8_000
 _MAX_CWD_CHARS = 2_000
 _MAX_OUTPUT_CHARS = 24_000
+_MAX_IMAGE_PROMPT_CHARS = 8_000
 
 
 class CapabilityBrokerError(RuntimeError):
@@ -47,6 +49,7 @@ class CapabilityEndpoint:
 
 
 SshExecutor = Callable[[str, str, str | None], Awaitable[tuple[int, str, str]]]
+ImageGenerator = Callable[[str, str | Path], Awaitable[dict[str, object]]]
 
 
 def _shorten(value: str) -> str:
@@ -99,6 +102,8 @@ class TaskCapabilityBroker:
         worker_uid: int,
         worker_gid: int,
         ssh_executor: SshExecutor = execute_command,
+        artifact_dir: str | Path | None = None,
+        image_generator: ImageGenerator = generate_mistral_image,
     ) -> None:
         self._bot = bot
         self._chat_id = chat_id
@@ -107,6 +112,8 @@ class TaskCapabilityBroker:
         self._worker_uid = worker_uid
         self._worker_gid = worker_gid
         self._ssh_executor = ssh_executor
+        self._artifact_dir = Path(artifact_dir) if artifact_dir is not None else None
+        self._image_generator = image_generator
         self._token = secrets.token_urlsafe(32)
         self._mount_dir: Path | None = None
         self._socket_path: Path | None = None
@@ -220,6 +227,8 @@ class TaskCapabilityBroker:
             return await self._memory_list(arguments)
         if action == "memory.delete":
             return await self._memory_delete(arguments)
+        if action == "image.generate":
+            return await self._image_generate(arguments)
         if action == "ssh.list":
             return await self._ssh_list()
         if action == "ssh.pubkey":
@@ -266,6 +275,22 @@ class TaskCapabilityBroker:
             raise CapabilityBrokerError(str(exc)) from exc
         if result.get("deleted"):
             await self._log_event("memory", "Memory fact deleted through capability broker")
+        return result
+
+    async def _image_generate(self, arguments: Mapping[str, object]) -> dict[str, object]:
+        """Generate only into the current task's already trusted output folder."""
+        if self._artifact_dir is None:
+            raise CapabilityBrokerError("image capability is unavailable for this task")
+        prompt = _required_string(
+            arguments,
+            "prompt",
+            maximum=_MAX_IMAGE_PROMPT_CHARS,
+        )
+        try:
+            result = await self._image_generator(prompt, self._artifact_dir)
+        except MistralImageError as exc:
+            raise CapabilityBrokerError(str(exc)) from exc
+        await self._log_event("image", "Mistral image saved through capability broker")
         return result
 
     async def _ssh_list(self) -> dict[str, object]:

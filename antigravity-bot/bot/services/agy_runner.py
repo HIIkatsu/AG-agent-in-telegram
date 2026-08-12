@@ -60,9 +60,12 @@ _BASE_RUNTIME_RULES = """\
 ## STRICT PROHIBITIONS
 - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО создавать файлы, изображения, скрипты или любые артефакты
   если пользователь ЯВНО об этом не попросил.
-- ЗАПРЕЩЕНО использовать инструмент generate_image без прямой просьбы пользователя.
+- НИКОГДА не используй встроенный инструмент generate_image. Если пользователь
+  прямо просит создать изображение, используй только нативный MCP-инструмент
+  mistral_generate_image. Он работает через настроенный Mistral API и не
+  передаёт ключ в песочницу.
 - НИКОГДА не заявляй, что изображение создано, сохранено или отправлено, пока
-  инструмент генерации не завершился без ошибки и готовый файл изображения не
+  mistral_generate_image не завершился без ошибки и готовый файл изображения не
   находится в $AGY_ARTIFACT_DIR. Если инструмент вернул ошибку или лимит,
   честно сообщи о неудаче и не выдумывай результат.
 - ЗАПРЕЩЕНО создавать файлы "для примера" или "для демонстрации" — отвечай текстом.
@@ -88,6 +91,8 @@ _BASE_RUNTIME_RULES = """\
 - Если пользователь явно запросил итоговый файл, документ или изображение для
   отправки в Telegram, сохрани только готовый пользовательский результат в
   $AGY_ARTIFACT_DIR. Этот каталог будет автоматически отправлен после задачи.
+- mistral_generate_image сам сохраняет готовое изображение в этот каталог. Не
+  копируй его повторно и не ищи файлы в иных каталогах.
 - Не помещай туда исходники проекта, .env, конфигурации, логи, секреты или
   промежуточные файлы. Для обычного ответа не создавай в нём ничего.
 
@@ -254,6 +259,7 @@ async def run_agy(
             task_id=tracker.task_id if tracker else None,
             worker_uid=settings.agy_worker_uid,
             worker_gid=settings.agy_worker_gid,
+            artifact_dir=artifact_dir,
         )
         endpoint = await broker.start()
         launch = build_sandbox_launch(
@@ -397,6 +403,15 @@ async def run_agy(
                             elif state in ("DONE", "ERROR"):
                                 if tracker:
                                     await tracker.on_tool_end(tool_name, state)
+                                    # A tool may finish long before AGY emits
+                                    # the final result event.  Keep an active,
+                                    # animated step on the task card so that
+                                    # this normal model-thinking interval is
+                                    # not indistinguishable from a frozen bot.
+                                    await tracker.on_tool_start(
+                                        "agent_final_response",
+                                        "Агент формирует итоговый ответ",
+                                    )
                                 
                                 if state == "ERROR" and isinstance(tool_info, dict):
                                     tool_err = tool_info.get("error", {})
@@ -413,6 +428,9 @@ async def run_agy(
                         status = result.get("status", "")
                         result_err = result.get("error", "")
                         response = result.get("response", "")
+
+                        if tracker:
+                            await tracker.on_tool_end("agent_final_response", "DONE")
 
                         if status == "ERROR":
                             err_text = result_err or 'Превышен лимит сообщений или ошибка модели.'
@@ -508,6 +526,7 @@ def _tool_label(tool_name: str, parameters: dict) -> str:
         "save_memory": "Сохранение памяти",
         "list_memory": "Чтение памяти",
         "delete_memory": "Удаление из памяти",
+        "mistral_generate_image": "Генерация изображения через Mistral",
     }
     for suffix, label in memory_tool_labels.items():
         if tool_name.endswith(suffix):

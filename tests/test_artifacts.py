@@ -76,6 +76,13 @@ def test_explicit_image_request_is_detected_but_an_analysis_request_is_not() -> 
         "Сгенерируй мне какую-нибудь простенькую страничку хотя бы сделай."
     )
     assert artifacts.is_explicit_artifact_request("Сделай HTML-страницу")
+    assert artifacts.is_explicit_artifact_request(
+        "Еще раз, можешь, пожалуйста, сделать другую HTML-страничку уже, совсем другую?"
+    )
+    assert artifacts.is_explicit_artifact_request(
+        "И потом еще скинуть мне изображение какого-нибудь из интернета."
+    )
+    assert artifacts.is_explicit_artifact_request("Сгенерируем мне какое-нибудь изображение")
     assert not artifacts.is_explicit_artifact_request("Проанализируй эту картинку")
 
 
