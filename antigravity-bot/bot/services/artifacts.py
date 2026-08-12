@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import FSInputFile
 
 from bot.config import settings
@@ -39,8 +40,24 @@ _EXPLICIT_ARTIFACT_RE = re.compile(
     r"презентаци\w*|таблиц\w*|архив\w*)"
     r"|(?:картинк\w*|изображени\w*|фото\w*)\s+(?:(?:за|с)?генерир(?:уй|овать)|"
     r"созд(?:ай|ать)|сделай|нарисуй)"
+    r"|(?:(?:за|с)?генерир(?:уй|овать)|созд(?:ай|ать)|сделай|напиши|сверстай|"
+    r"подготовь)\b[^\n]{0,100}?"
+    r"(?:html(?:[- ]?файл)?|веб[- ]?страниц\w*|страниц\w*|странич\w*|сайт\w*|лендинг\w*|"
+    r"web[- ]?page\w*|website\w*)"
     r"|(?:send|generate|create|export|save)\s+(?:an?\s+)?"
-    r"(?:image|picture|photo|file|document|pdf|spreadsheet|presentation|archive)"
+    r"(?:image|picture|photo|file|document|pdf|spreadsheet|presentation|archive|"
+    r"html|web[- ]?page|website|landing[- ]?page)"
+    r")",
+    re.IGNORECASE,
+)
+
+_EXPLICIT_IMAGE_RE = re.compile(
+    r"(?:"
+    r"(?:(?:за|с)?генерир(?:уй|овать)|созд(?:ай|ать)|сделай|нарисуй)\b[^\n]{0,80}?"
+    r"(?:картинк\w*|изображени\w*|фото\w*)"
+    r"|(?:картинк\w*|изображени\w*|фото\w*)\s+(?:(?:за|с)?генерир(?:уй|овать)|"
+    r"созд(?:ай|ать)|сделай|нарисуй)"
+    r"|(?:send|generate|create|draw)\b[^\n]{0,80}?(?:image|picture|photo)"
     r")",
     re.IGNORECASE,
 )
@@ -172,8 +189,48 @@ def cleanup_task_artifact_directory(task_id: int) -> None:
 
 
 def is_explicit_artifact_request(text: str) -> bool:
-    """Whether the user explicitly requested a file or image in Telegram."""
+    """Whether the user explicitly requested a deliverable in Telegram.
+
+    A web page is a deliverable even when its wording does not literally say
+    ``file``. The output remains confined to the exact task directory; this
+    is not a watcher over a shared scratch folder.
+    """
     return bool(_EXPLICIT_ARTIFACT_RE.search(text))
+
+
+def is_explicit_image_request(text: str) -> bool:
+    """Whether the request specifically requires an image file as its result."""
+    return bool(_EXPLICIT_IMAGE_RE.search(text))
+
+
+def has_image_artifact(artifacts: ArtifactCollection) -> bool:
+    """Return whether collected output contains an image Telegram can deliver."""
+    return any(item.path.suffix.lower() in _IMAGE_EXTENSIONS for item in artifacts.files)
+
+
+def validate_requested_artifacts(
+    prompt: str,
+    artifacts: ArtifactCollection | None,
+) -> str | None:
+    """Return a user-safe terminal error when a promised deliverable is absent.
+
+    The final answer may be fluent even when a generation tool failed.  This
+    check is intentionally based on inspected files rather than model prose or
+    a tool's reported state.
+    """
+    if not is_explicit_artifact_request(prompt):
+        return None
+    if artifacts is None or not artifacts.files:
+        return (
+            "❌ Итоговый файл не был создан, поэтому я не выдаю ложное "
+            "подтверждение о готовом результате."
+        )
+    if is_explicit_image_request(prompt) and not has_image_artifact(artifacts):
+        return (
+            "❌ Изображение не было создано. Генерация не прошла, поэтому "
+            "результат в Telegram не отправлен."
+        )
+    return None
 
 
 def _limits() -> tuple[int, int]:
@@ -256,6 +313,8 @@ async def deliver_task_artifacts(
     """Send files as photos where appropriate and retain failed output safely."""
     delivered = 0
     failed = 0
+    from bot.services.telegram_rate_limiter import telegram_rate_limiter
+
     for artifact in artifacts.files:
         path = artifact.path
         try:
@@ -274,12 +333,21 @@ async def deliver_task_artifacts(
         try:
             if suffix in _IMAGE_EXTENSIONS:
                 try:
-                    message = await bot.send_photo(
+                    async def send_photo():
+                        return await bot.send_photo(
+                            chat_id,
+                            FSInputFile(str(path)),
+                            caption=artifact.relative_path,
+                            message_thread_id=thread_id,
+                        )
+
+                    message = await telegram_rate_limiter.request(
                         chat_id,
-                        FSInputFile(str(path)),
-                        caption=artifact.relative_path,
-                        message_thread_id=thread_id,
+                        send_photo,
+                        label=f"artifact photo {artifact.relative_path}",
                     )
+                except TelegramRetryAfter:
+                    raise
                 except Exception:
                     # Telegram rejects some valid image files as photos (for
                     # example an unsupported animation or dimensions). A
@@ -289,18 +357,32 @@ async def deliver_task_artifacts(
                         artifact.relative_path,
                         exc_info=True,
                     )
-                    message = await bot.send_document(
+                    async def send_document_fallback():
+                        return await bot.send_document(
+                            chat_id,
+                            FSInputFile(str(path)),
+                            caption=artifact.relative_path,
+                            message_thread_id=thread_id,
+                        )
+
+                    message = await telegram_rate_limiter.request(
+                        chat_id,
+                        send_document_fallback,
+                        label=f"artifact document fallback {artifact.relative_path}",
+                    )
+            else:
+                async def send_document():
+                    return await bot.send_document(
                         chat_id,
                         FSInputFile(str(path)),
                         caption=artifact.relative_path,
                         message_thread_id=thread_id,
                     )
-            else:
-                message = await bot.send_document(
+
+                message = await telegram_rate_limiter.request(
                     chat_id,
-                    FSInputFile(str(path)),
-                    caption=artifact.relative_path,
-                    message_thread_id=thread_id,
+                    send_document,
+                    label=f"artifact document {artifact.relative_path}",
                 )
         except Exception:
             failed += 1

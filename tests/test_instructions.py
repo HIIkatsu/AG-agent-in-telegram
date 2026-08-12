@@ -112,6 +112,36 @@ class _FakeProcess:
         return self.returncode
 
 
+class _FailedImageProcess:
+    def __init__(self) -> None:
+        tool_error = {
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "state": "ERROR",
+                "tool_name": "generate_image",
+                "tool_info": {"error": {"message": "Image failed to generate."}},
+            },
+        }
+        result = {
+            "event": "result",
+            "result": {
+                "status": "ERROR",
+                "error": "Image failed to generate.",
+                "response": "Изображение успешно создано и отправлено.",
+            },
+        }
+        lines = "\n".join((json.dumps(tool_error), json.dumps(result), ""))
+        self.stdout = _FakeReader([lines.encode("utf-8")])
+        self.stderr = _FakeReader([])
+        self.stdin = _FakeStdin()
+        self.returncode = 0
+        self.pid = 12346
+
+    async def wait(self) -> int:
+        return self.returncode
+
+
 def test_code_run_logs_instruction_hash_without_modifying_project_rules(
     tmp_path: Path,
     monkeypatch,
@@ -288,3 +318,69 @@ def test_runner_fails_closed_when_the_sandbox_cannot_be_built(
     assert closed
     create_process.assert_not_awaited()
     on_chunk.assert_awaited_once()
+
+
+def test_runner_reports_one_terminal_image_error_and_discards_false_success(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    memory = GlobalMemorySnapshot(
+        content="[]",
+        sha256="m" * 64,
+        count=0,
+        total_count=0,
+        truncated=False,
+    )
+    monkeypatch.setattr(
+        agy_runner,
+        "load_global_memory_snapshot",
+        AsyncMock(return_value=memory),
+    )
+
+    class _FakeBroker:
+        async def start(self):
+            return SimpleNamespace(mount_dir=tmp_path / "capabilities", token="task-token")
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(agy_runner, "TaskCapabilityBroker", lambda **_kwargs: _FakeBroker())
+    monkeypatch.setattr(
+        agy_runner,
+        "build_sandbox_launch",
+        lambda **kwargs: SimpleNamespace(
+            command=("agy",),
+            env={"PATH": "/usr/bin"},
+            cwd=kwargs["execution_dir"],
+        ),
+    )
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return _FailedImageProcess()
+
+    monkeypatch.setattr(
+        agy_runner.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+    artifact_dir = tmp_path / "task-artifacts" / "task-19"
+    artifact_dir.parent.mkdir()
+    artifact_dir.mkdir()
+    on_chunk = AsyncMock()
+
+    result = asyncio.run(
+        agy_runner.run_agy(
+            prompt="Загенерируй картинку",
+            conversation_id="11111111-1111-1111-1111-111111111111",
+            workspace_dir=str(tmp_path),
+            on_chunk=on_chunk,
+            bot=object(),
+            chat_id=1,
+            execution_profile="chat",
+            artifact_dir=artifact_dir,
+        )
+    )
+
+    assert result.count("Image failed to generate.") == 1
+    assert "Изображение успешно создано" not in result
+    assert "Ошибка выполнения" in result

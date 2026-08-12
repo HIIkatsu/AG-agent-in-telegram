@@ -61,6 +61,10 @@ _BASE_RUNTIME_RULES = """\
 - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО создавать файлы, изображения, скрипты или любые артефакты
   если пользователь ЯВНО об этом не попросил.
 - ЗАПРЕЩЕНО использовать инструмент generate_image без прямой просьбы пользователя.
+- НИКОГДА не заявляй, что изображение создано, сохранено или отправлено, пока
+  инструмент генерации не завершился без ошибки и готовый файл изображения не
+  находится в $AGY_ARTIFACT_DIR. Если инструмент вернул ошибку или лимит,
+  честно сообщи о неудаче и не выдумывай результат.
 - ЗАПРЕЩЕНО создавать файлы "для примера" или "для демонстрации" — отвечай текстом.
 - ЗАПРЕЩЕНО упоминать или выводить пользователю технические пути системных папок
   (вроде /tmp/workspaces/..., /root/... или scratch).
@@ -297,6 +301,7 @@ async def run_agy(
 
     decoder = IncrementalStreamDecoder("utf-8", errors="replace")
     full_response = ""
+    streamed_response = ""
     stderr_response = ""
     line_buffer = ""
 
@@ -330,6 +335,7 @@ async def run_agy(
                         data = json.loads(line)
                     except json.JSONDecodeError:
                         full_response += line + "\n"
+                        streamed_response += line + "\n"
                         await on_chunk(line + "\n")
                         continue
 
@@ -343,19 +349,23 @@ async def run_agy(
                         tool_info = step.get("tool_info", {})
                         params = tool_info.get("parameters", {}) if isinstance(tool_info, dict) else {}
 
-                        # 1. Text delta
+                        # 1. Text delta.  Tool failures already have a red
+                        # lifecycle entry on the task card; streaming their
+                        # raw text here used to show the same "Image failed"
+                        # error several times and then let a model narrative
+                        # contradict it.
                         delta = step.get("text_delta")
-                        if isinstance(delta, str) and delta:
+                        is_failed_tool_update = step_type == "tool" and state == "ERROR"
+                        if isinstance(delta, str) and delta and not is_failed_tool_update:
                             full_response += delta
+                            streamed_response += delta
                             await on_chunk(delta)
 
                         # 2. Handle error step types
                         if step_type == "error_message":
                             err_text = step.get("error_message", step.get("text_delta", ""))
                             if err_text:
-                                err_formatted = f"\n\n❌ <b>Ошибка CLI:</b>\n<pre><code>{err_text}</code></pre>"
-                                full_response += err_formatted
-                                await on_chunk(err_formatted)
+                                logger.warning("agy CLI error event: %s", err_text)
 
                         # 3. Tool Lifecycle and Permission Handler
                         if step_type == "tool" and tool_name:
@@ -392,9 +402,11 @@ async def run_agy(
                                     tool_err = tool_info.get("error", {})
                                     err_msg = tool_err.get("message", str(tool_err)) if isinstance(tool_err, dict) else str(tool_err)
                                     if err_msg and "User denied permission" not in err_msg and "Permission denied" not in err_msg:
-                                        err_formatted = f"\n\n❌ **Ошибка инструмента ({tool_name}):**\n```\n{err_msg}\n```"
-                                        full_response += err_formatted
-                                        await on_chunk(err_formatted)
+                                        logger.warning(
+                                            "agy tool failed: %s: %s",
+                                            tool_name,
+                                            err_msg,
+                                        )
 
                     elif event == "result":
                         result = data.get("result", {})
@@ -404,19 +416,30 @@ async def run_agy(
 
                         if status == "ERROR":
                             err_text = result_err or 'Превышен лимит сообщений или ошибка модели.'
-                            
-                            is_limit_error = any(kw in err_text.lower() for kw in ("limit", "token", "quota", "rate", "превышен", "ошибка модели"))
-                            has_response = isinstance(response, str) and len(response) > 20
-                            
-                            if is_limit_error or not has_response:
-                                err_formatted = f"\n\n❌ **Ошибка выполнения / Лимиты:**\n```\n{err_text}\n```"
-                                full_response += err_formatted
-                                await on_chunk(err_formatted)
+                            # A CLI result marked ERROR is authoritative even
+                            # if the model also emits a fluent-looking answer.
+                            # Streaming that answer as success caused the bot
+                            # to claim an image existed after "Image failed to
+                            # generate".  Surface one error and do not append
+                            # the untrusted final narrative.
+                            err_formatted = f"\n\n❌ **Ошибка выполнения / Лимиты:**\n```\n{err_text}\n```"
+                            full_response += err_formatted
+                            await on_chunk(err_formatted)
+                            response = ""
                         
                         if isinstance(response, str) and response:
-                            remainder = response[len(full_response):]
+                            if response.startswith(streamed_response):
+                                remainder = response[len(streamed_response):]
+                            elif response in streamed_response:
+                                remainder = ""
+                            else:
+                                # Stream formats occasionally omit a prefix;
+                                # preserve the final answer once rather than
+                                # slicing it against formatted error output.
+                                remainder = response
                             if remainder:
                                 full_response += remainder
+                                streamed_response += remainder
                                 await on_chunk(remainder)
 
                         if proc.stdin and not proc.stdin.is_closing():
