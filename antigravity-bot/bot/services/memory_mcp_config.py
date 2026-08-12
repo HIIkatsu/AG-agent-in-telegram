@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import os
+import sys
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,12 +22,24 @@ class MemoryMcpConfigError(RuntimeError):
     """The shared AGY MCP configuration cannot be safely updated."""
 
 
+class InvalidMemoryMcpConfigError(MemoryMcpConfigError):
+    """The MCP config cannot be parsed as JSON or JSONC."""
+
+
 @dataclass(frozen=True)
 class MemoryMcpConfigReport:
     """Result of ensuring the bot-owned MCP server entry."""
 
     config_path: Path
     state: str
+
+
+@dataclass(frozen=True)
+class MemoryMcpConfigRepairReport:
+    """Result of explicitly repairing an unreadable MCP config."""
+
+    config_path: Path
+    backup_path: Path
 
 
 def _expected_server(
@@ -149,7 +165,7 @@ def _load_json_or_jsonc(raw: str, config_path: Path) -> object:
             normalized = _strip_jsonc_trailing_commas(_strip_jsonc_comments(raw))
             return json.loads(normalized)
         except (json.JSONDecodeError, ValueError) as jsonc_error:
-            raise MemoryMcpConfigError(
+            raise InvalidMemoryMcpConfigError(
                 f"MCP config is not valid JSON or JSONC: {config_path}"
             ) from jsonc_error
 
@@ -159,6 +175,10 @@ def _load_config(config_path: Path) -> dict[str, Any]:
         raw = config_path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {}
+    except UnicodeError as exc:
+        raise InvalidMemoryMcpConfigError(
+            f"MCP config is not valid UTF-8: {config_path}"
+        ) from exc
     except OSError as exc:
         raise MemoryMcpConfigError(
             f"Cannot read MCP config {config_path}: {exc}"
@@ -212,6 +232,106 @@ def _write_config(config_path: Path, payload: dict[str, Any]) -> None:
         ) from exc
 
 
+def _invalid_backup_path(config_path: Path, raw: bytes) -> Path:
+    """Return a unique local-only filename without exposing config contents."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    digest = hashlib.sha256(raw).hexdigest()[:12]
+    return config_path.with_name(
+        f"{config_path.name}.invalid-{stamp}-{digest}.bak"
+    )
+
+
+def _write_private_backup(backup_path: Path, raw: bytes) -> None:
+    """Persist original invalid bytes atomically with owner-only permissions."""
+    if backup_path.exists():
+        raise MemoryMcpConfigError(
+            f"Refusing to overwrite existing MCP config backup: {backup_path}"
+        )
+    try:
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=".ag-memory-mcp-backup-",
+            suffix=".tmp",
+            dir=backup_path.parent,
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                os.chmod(temp_name, 0o600)
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, backup_path)
+        except Exception:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+            raise
+    except OSError as exc:
+        raise MemoryMcpConfigError(
+            f"Cannot create MCP config backup {backup_path}: {exc}"
+        ) from exc
+
+
+def repair_invalid_memory_mcp_config(
+    *,
+    config_path: Path = DEFAULT_MCP_CONFIG_PATH,
+    python_executable: Path,
+    bot_root: Path,
+    db_path: str,
+) -> MemoryMcpConfigRepairReport:
+    """Back up and replace only a syntactically unreadable MCP config.
+
+    This is intentionally an explicit operator action. Valid configurations,
+    including those with an incompatible schema, are never replaced because
+    they may contain unrelated user-owned MCP server definitions.
+    """
+    target = config_path.expanduser()
+    if target.is_symlink():
+        raise MemoryMcpConfigError(
+            f"Refusing to repair MCP config symlink: {target}"
+        )
+
+    try:
+        _load_config(target)
+    except InvalidMemoryMcpConfigError:
+        pass
+    except MemoryMcpConfigError as exc:
+        raise MemoryMcpConfigError(
+            f"Refusing to replace a non-syntax MCP config error: {exc}"
+        ) from exc
+    else:
+        raise MemoryMcpConfigError(
+            f"MCP config is already valid; refusing repair: {target}"
+        )
+
+    try:
+        raw = target.read_bytes()
+    except OSError as exc:
+        raise MemoryMcpConfigError(
+            f"Cannot read invalid MCP config {target}: {exc}"
+        ) from exc
+
+    backup_path = _invalid_backup_path(target, raw)
+    _write_private_backup(backup_path, raw)
+    _write_config(
+        target,
+        {
+            "mcpServers": {
+                MEMORY_MCP_SERVER_NAME: _expected_server(
+                    python_executable=python_executable,
+                    bot_root=bot_root,
+                    db_path=db_path,
+                )
+            }
+        },
+    )
+    return MemoryMcpConfigRepairReport(
+        config_path=target,
+        backup_path=backup_path,
+    )
+
+
 def ensure_memory_mcp_config(
     *,
     config_path: Path = DEFAULT_MCP_CONFIG_PATH,
@@ -248,3 +368,40 @@ def ensure_memory_mcp_config(
     _write_config(target, payload)
     state = "installed" if existing is None else "updated"
     return MemoryMcpConfigReport(config_path=target, state=state)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run an explicit, no-content-exposure repair for a broken global config."""
+    parser = argparse.ArgumentParser(
+        description="Repair an invalid AGY MCP config without exposing its contents."
+    )
+    parser.add_argument(
+        "command",
+        choices=("repair-invalid",),
+        help="back up a syntactically invalid config and install native memory MCP",
+    )
+    args = parser.parse_args(argv)
+
+    if args.command == "repair-invalid":
+        from bot.config import settings
+        from bot.services.instructions import BOT_ROOT
+
+        try:
+            report = repair_invalid_memory_mcp_config(
+                config_path=Path(settings.agy_mcp_config_path),
+                python_executable=Path(sys.executable),
+                bot_root=BOT_ROOT,
+                db_path=settings.db_path,
+            )
+        except MemoryMcpConfigError as exc:
+            print(f"MCP repair was not applied: {exc}", file=sys.stderr)
+            return 1
+        print(f"MCP config repaired: {report.config_path}")
+        print(f"Original config backup (0600): {report.backup_path}")
+        return 0
+
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
