@@ -370,17 +370,38 @@ def test_memory_mcp_configuration_failure_does_not_stop_the_bot(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     from bot import __main__ as bot_main
+    from bot.config import settings
     from bot.services import memory_mcp_config
 
     def fail_configuration(**_: object) -> None:
         raise MemoryMcpConfigError("invalid user config")
 
     monkeypatch.setattr(memory_mcp_config, "ensure_memory_mcp_config", fail_configuration)
+    monkeypatch.setattr(settings, "agy_allow_unsandboxed_dev", True)
 
     with caplog.at_level(logging.WARNING, logger=bot_main.logger.name):
         assert bot_main._configure_native_memory_tools() is False
 
     assert "bot will continue without them" in caplog.text
+
+
+def test_production_uses_the_task_scoped_memory_mcp_without_touching_user_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from bot import __main__ as bot_main
+    from bot.config import settings
+    from bot.services import memory_mcp_config
+
+    # A production worker owns a generated task config, so the historical
+    # service-home config must not be opened or repaired on bot startup.
+    monkeypatch.setattr(settings, "agy_allow_unsandboxed_dev", False)
+
+    def must_not_be_called(**_: object) -> None:
+        raise AssertionError("production must not configure the service-home MCP file")
+
+    monkeypatch.setattr(memory_mcp_config, "ensure_memory_mcp_config", must_not_be_called)
+
+    assert bot_main._configure_native_memory_tools() is True
 
 
 def test_mcp_config_refuses_to_overwrite_a_user_owned_server(tmp_path: Path) -> None:

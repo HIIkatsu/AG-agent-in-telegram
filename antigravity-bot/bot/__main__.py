@@ -34,7 +34,13 @@ logger = logging.getLogger(__name__)
 
 
 def _configure_native_memory_tools() -> bool:
-    """Register native memory tools without making the bot unavailable."""
+    """Register direct memory MCP only for the explicit unsandboxed dev mode."""
+    if not settings.agy_allow_unsandboxed_dev:
+        logger.info(
+            "AGY native memory tools are supplied by the task-scoped capability MCP config"
+        )
+        return True
+
     from pathlib import Path
 
     from bot.services.instructions import BOT_ROOT
@@ -107,6 +113,29 @@ def check_startup() -> None:
     # This integration is optional: an invalid third-party MCP config must not
     # take down the Telegram bot or risk being overwritten during startup.
     _configure_native_memory_tools()
+
+    # A missing sandbox must not create an unprotected fallback. The bot stays
+    # available for Telegram commands, but AGY tasks fail closed with a clear
+    # setup error until the dedicated worker is provisioned.
+    from bot.services.worker_sandbox import (
+        WorkerSandboxError,
+        validate_sandbox_configuration,
+    )
+
+    try:
+        validate_sandbox_configuration()
+    except WorkerSandboxError as exc:
+        logger.error(
+            "AGY sandbox is not ready; tasks will fail closed until it is provisioned: %s",
+            exc,
+        )
+    else:
+        logger.info("AGY sandbox configuration is ready")
+    if settings.agy_allow_unsandboxed_dev:
+        logger.critical(
+            "AGY_ALLOW_UNSANDBOXED_DEV=true: AGY can access the host filesystem; "
+            "do not use this in production"
+        )
 
     # Check source and isolated task workspace roots.
     for workspace_root in (settings.workspaces_dir, settings.task_workspaces_dir):

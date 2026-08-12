@@ -18,6 +18,7 @@ os.environ.setdefault("ALLOWED_USER_IDS", "1")
 
 from bot.services import agy_runner
 from bot.services import instructions as instruction_service
+from bot.config import settings
 from bot.services.global_memory import GlobalMemorySnapshot
 from bot.services.instructions import InstructionBundle, load_instruction_bundle
 
@@ -142,6 +143,29 @@ def test_code_run_logs_instruction_hash_without_modifying_project_rules(
 
     captured: dict[str, object] = {}
 
+    class _FakeBroker:
+        closed = False
+
+        def __init__(self, **kwargs) -> None:
+            captured["broker_kwargs"] = kwargs
+
+        async def start(self):
+            return SimpleNamespace(mount_dir=tmp_path / "capabilities", token="task-token")
+
+        async def close(self) -> None:
+            _FakeBroker.closed = True
+
+    def fake_build_sandbox_launch(**kwargs):
+        captured["sandbox_kwargs"] = kwargs
+        return SimpleNamespace(
+            command=tuple(kwargs["agy_args"]),
+            env={"PATH": "/usr/bin", "LANG": "C.UTF-8"},
+            cwd=kwargs["execution_dir"],
+        )
+
+    monkeypatch.setattr(agy_runner, "TaskCapabilityBroker", _FakeBroker)
+    monkeypatch.setattr(agy_runner, "build_sandbox_launch", fake_build_sandbox_launch)
+
     async def fake_create_subprocess_exec(*args, **kwargs):
         captured["args"] = args
         captured["kwargs"] = kwargs
@@ -193,6 +217,64 @@ def test_code_run_logs_instruction_hash_without_modifying_project_rules(
         ],
     )
     child_env = captured["kwargs"]["env"]
-    assert child_env["AGY_BOT_ROOT"] == str(ROOT / "antigravity-bot")
-    assert child_env["AGY_BOT_PYTHON"] == sys.executable
-    assert child_env["AGY_BOT_DB_PATH"]
+    assert "AGY_BOT_ROOT" not in child_env
+    assert "AGY_BOT_PYTHON" not in child_env
+    assert "AGY_BOT_DB_PATH" not in child_env
+    assert "BOT_TOKEN" not in child_env
+    assert captured["sandbox_kwargs"]["capability_token"] == "task-token"
+    assert captured["sandbox_kwargs"]["thread_id"] is None
+    assert _FakeBroker.closed
+
+
+def test_runner_fails_closed_when_the_sandbox_cannot_be_built(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    memory = GlobalMemorySnapshot(
+        content="[]",
+        sha256="m" * 64,
+        count=0,
+        total_count=0,
+        truncated=False,
+    )
+    monkeypatch.setattr(
+        agy_runner,
+        "load_global_memory_snapshot",
+        AsyncMock(return_value=memory),
+    )
+    monkeypatch.setattr(settings, "agy_allow_unsandboxed_dev", False)
+    closed = False
+
+    class _FakeBroker:
+        async def start(self):
+            return SimpleNamespace(mount_dir=tmp_path, token="task-token")
+
+        async def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    def fail_build(**_kwargs):
+        raise agy_runner.WorkerSandboxError("worker home is missing")
+
+    create_process = AsyncMock()
+    on_chunk = AsyncMock()
+    monkeypatch.setattr(agy_runner, "TaskCapabilityBroker", lambda **_kwargs: _FakeBroker())
+    monkeypatch.setattr(agy_runner, "build_sandbox_launch", fail_build)
+    monkeypatch.setattr(agy_runner.asyncio, "create_subprocess_exec", create_process)
+
+    result = asyncio.run(
+        agy_runner.run_agy(
+            prompt="inspect",
+            conversation_id="11111111-1111-1111-1111-111111111111",
+            workspace_dir=str(tmp_path),
+            on_chunk=on_chunk,
+            bot=object(),
+            chat_id=1,
+            execution_profile="code",
+        )
+    )
+
+    assert "Песочница AGY не готова" in result
+    assert closed
+    create_process.assert_not_awaited()
+    on_chunk.assert_awaited_once()
