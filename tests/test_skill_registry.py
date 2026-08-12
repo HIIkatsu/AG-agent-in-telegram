@@ -173,3 +173,15 @@ def test_registry_never_overwrites_a_modified_managed_skill(tmp_path: Path) -> N
         ensure_global_skills(source, target)
 
     assert managed_skill.read_text(encoding="utf-8") == "local change"
+
+
+def test_registry_refuses_a_symlinked_native_skills_directory(tmp_path: Path) -> None:
+    source = tmp_path / "bundled"
+    target = tmp_path / "native-skills"
+    elsewhere = tmp_path / "elsewhere"
+    _create_skill(source, "alpha")
+    elsewhere.mkdir()
+    target.symlink_to(elsewhere, target_is_directory=True)
+
+    with pytest.raises(SkillRegistryError, match="symbolic link"):
+        ensure_global_skills(source, target)

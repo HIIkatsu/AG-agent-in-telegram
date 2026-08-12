@@ -119,19 +119,24 @@ class TaskCapabilityBroker:
         return CapabilityEndpoint(mount_dir=self._mount_dir, token=self._token)
 
     async def start(self) -> CapabilityEndpoint:
-        """Create a private socket directory readable only by the worker UID."""
+        """Create one unlistable, token-protected socket endpoint for a worker."""
         if self._server is not None:
             return self.endpoint
         root = Path(settings.agy_capability_socket_dir).expanduser().resolve()
         try:
-            root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(root, 0o700)
+            root.mkdir(parents=True, exist_ok=True, mode=0o711)
+            # Bubblewrap itself is execed as the non-root worker. It must be
+            # able to traverse this root to bind its one unpredictable task
+            # endpoint, but it cannot list sibling endpoints. The bearer token
+            # remains mandatory for every request.
+            os.chmod(root, 0o711)
             mount_dir = Path(tempfile.mkdtemp(prefix="task-capability-", dir=root))
-            # The worker cannot list it but can traverse to its own socket.
+            # The worker cannot list the 0711 parent but can traverse to its
+            # own socket.
             # The mount namespace can remap user IDs, so socket authorization
             # cannot rely on Unix ownership. A high-entropy per-task token is
-            # mandatory for every request; the random path plus the parent 0700
-            # directory are a second containment layer.
+            # mandatory for every request; the random path plus the unlistable
+            # parent directory are a second containment layer.
             os.chmod(mount_dir, 0o711)
             socket_path = mount_dir / "broker.sock"
             server = await asyncio.start_unix_server(self._handle_client, path=socket_path)

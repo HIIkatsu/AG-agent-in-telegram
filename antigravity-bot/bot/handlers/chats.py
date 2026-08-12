@@ -299,7 +299,10 @@ def purge_stale_cli_sessions() -> int:
 
     Returns the number of purged entries.
     """
-    cli_dir = Path(os.path.expanduser("~/.gemini/antigravity-cli"))
+    # AGY tasks run under the dedicated worker home, not under the bot
+    # service account's root home. Limiting cleanup there also avoids touching
+    # unrelated local CLI state.
+    cli_dir = Path(settings.agy_worker_home).expanduser() / ".gemini/antigravity-cli"
     brain_dir = cli_dir / "brain"
     if not brain_dir.is_dir():
         return 0

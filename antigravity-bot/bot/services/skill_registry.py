@@ -159,7 +159,18 @@ def ensure_global_skills(
     Real directories are used because AGY does not document directory-symlink discovery.
     """
     source_dir = source_dir.expanduser().resolve()
-    target_dir = target_dir.expanduser().resolve()
+    raw_target_dir = target_dir.expanduser()
+    try:
+        target_metadata = raw_target_dir.lstat()
+    except FileNotFoundError:
+        target_metadata = None
+    except OSError as exc:
+        raise SkillRegistryError(f"Cannot inspect global skills directory: {exc}") from exc
+    if target_metadata is not None and raw_target_dir.is_symlink():
+        raise SkillRegistryError(
+            f"Global skills directory must not be a symbolic link: {raw_target_dir}"
+        )
+    target_dir = raw_target_dir.resolve()
     if source_dir == target_dir:
         raise SkillRegistryError("Bundled and global skills directories must differ")
 

@@ -1,9 +1,20 @@
-"""Artifact Post-Tool Delivery & Cleanup across Workspaces & Scratchpad."""
+"""Safe, task-scoped delivery of AGY-generated artifacts.
+
+An AGY task is allowed to write user-facing output only to its own directory
+below ``TASK_ARTIFACTS_DIR``. This module deliberately never scans a shared
+CLI scratch directory: such a scan can accidentally pick up another task's
+file, a file created before the task, or a root-owned AGY artifact.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import re
+import shutil
+import stat
+from dataclasses import dataclass
 from pathlib import Path
 
 from aiogram import Bot
@@ -13,28 +24,294 @@ from bot.config import settings
 
 logger = logging.getLogger(__name__)
 
-_IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+_IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"})
+_MAX_ARTIFACT_DEPTH = 4
+_MAX_ARTIFACT_PATH_LENGTH = 240
 
-_TRACK_EXT = (
-    _IMAGE_EXT
-    | {
-        ".html", ".css", ".js", ".py", ".ts", ".tsx", ".jsx",
-        ".pptx", ".docx", ".xlsx", ".pdf", ".svg",
-        ".zip", ".tar", ".gz", ".rar", ".7z",
-        ".json", ".yaml", ".yml", ".toml", ".xml",
-        ".md", ".txt", ".csv", ".sh", ".bat", ".sql",
-    }
+# Direct output has to be intentional. This keeps ordinary chat replies and
+# incidental project files from being uploaded to Telegram merely because a
+# model happened to create them.
+_EXPLICIT_ARTIFACT_RE = re.compile(
+    r"(?:"
+    r"(?:(?:за|с)?генерир(?:уй|овать)|созд(?:ай|ать)|сделай|нарисуй|отправь|пришли|"
+    r"подготовь|экспортируй|сохрани)\s+(?:мне\s+)?"
+    r"(?:картинк\w*|изображени\w*|фото\w*|файл\w*|документ\w*|pdf|"
+    r"презентаци\w*|таблиц\w*|архив\w*)"
+    r"|(?:картинк\w*|изображени\w*|фото\w*)\s+(?:(?:за|с)?генерир(?:уй|овать)|"
+    r"созд(?:ай|ать)|сделай|нарисуй)"
+    r"|(?:send|generate|create|export|save)\s+(?:an?\s+)?"
+    r"(?:image|picture|photo|file|document|pdf|spreadsheet|presentation|archive)"
+    r")",
+    re.IGNORECASE,
 )
 
-_DELIVER_EXT = {
-    ".pdf", ".zip", ".tar", ".gz", ".rar", ".7z",
-    ".pptx", ".docx", ".xlsx", ".html"
-}
 
-_DEFAULT_SCRATCH_DIRS = [
-    "/root/.gemini/antigravity-cli/scratch",
-    "/root/.gemini/antigravity-ide/scratch",
-]
+class ArtifactError(RuntimeError):
+    """A task output directory or artifact is unsafe to use."""
+
+
+@dataclass(frozen=True)
+class TaskArtifact:
+    """One regular file produced in the exact directory for a task."""
+
+    path: Path
+    relative_path: str
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class ArtifactCollection:
+    """Files safe to deliver and files intentionally left on the VPS."""
+
+    files: tuple[TaskArtifact, ...]
+    skipped: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ArtifactDeliveryReport:
+    """Outcome used to decide whether the task output can be cleaned up."""
+
+    delivered: int
+    failed: int
+
+
+def _managed_root() -> Path:
+    """Return the bot-owned output root, rejecting symlinked configuration."""
+    configured = Path(settings.task_artifacts_dir).expanduser()
+    try:
+        existing = configured.lstat()
+    except FileNotFoundError:
+        try:
+            configured.mkdir(parents=True, mode=0o700, exist_ok=False)
+        except FileExistsError:
+            # Two independent Telegram topics may begin their first task at
+            # once. Re-inspect rather than failing one of the safe requests.
+            pass
+        existing = configured.lstat()
+    except OSError as exc:
+        raise ArtifactError(f"Cannot inspect TASK_ARTIFACTS_DIR: {exc}") from exc
+
+    if stat.S_ISLNK(existing.st_mode):
+        raise ArtifactError("TASK_ARTIFACTS_DIR must not be a symbolic link")
+    if not stat.S_ISDIR(existing.st_mode):
+        raise ArtifactError("TASK_ARTIFACTS_DIR must be a directory")
+    if existing.st_uid != os.geteuid():
+        raise ArtifactError("TASK_ARTIFACTS_DIR must be owned by the bot service user")
+    mode = stat.S_IMODE(existing.st_mode)
+    if mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ArtifactError("TASK_ARTIFACTS_DIR must not be group- or world-writable")
+    try:
+        return configured.resolve(strict=True)
+    except OSError as exc:
+        raise ArtifactError(f"Cannot resolve TASK_ARTIFACTS_DIR: {exc}") from exc
+
+
+def task_artifact_directory(task_id: int) -> Path:
+    """Return the one exact output directory reserved for a positive task ID."""
+    if not isinstance(task_id, int) or isinstance(task_id, bool) or task_id <= 0:
+        raise ArtifactError("Task artifact directory requires a positive task ID")
+    root = _managed_root()
+    target = root / f"task-{task_id}"
+    try:
+        target.relative_to(root)
+    except ValueError as exc:  # Defensive even though task_id is numeric.
+        raise ArtifactError("Task artifact directory escapes its managed root") from exc
+    return target
+
+
+def _require_exact_task_directory(task_id: int, *, must_exist: bool) -> Path:
+    target = task_artifact_directory(task_id)
+    if not target.exists() and not target.is_symlink():
+        if must_exist:
+            raise ArtifactError(f"Task artifact directory does not exist for task #{task_id}")
+        return target
+    try:
+        metadata = target.lstat()
+    except OSError as exc:
+        raise ArtifactError(f"Cannot inspect task artifact directory: {exc}") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ArtifactError("Task artifact directory must not be a symbolic link")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ArtifactError("Task artifact path must be a directory")
+    return target
+
+
+def prepare_task_artifact_directory(task_id: int) -> Path:
+    """Allocate a fresh private directory writable only by the AGY worker.
+
+    The service user owns the parent, while the worker owns only the task leaf.
+    Therefore a compromised task cannot create sibling task paths or read their
+    names. Reusing an existing directory is refused instead of risking stale
+    output being delivered for a later task with the same ID.
+    """
+    target = _require_exact_task_directory(task_id, must_exist=False)
+    if target.exists() or target.is_symlink():
+        raise ArtifactError(f"Task artifact directory already exists for task #{task_id}")
+    try:
+        target.mkdir(mode=0o750)
+        os.chown(target, settings.agy_worker_uid, settings.agy_worker_gid)
+        os.chmod(target, 0o750)
+    except OSError as exc:
+        try:
+            target.rmdir()
+        except OSError:
+            pass
+        raise ArtifactError(f"Cannot prepare task artifact directory: {exc}") from exc
+    return target
+
+
+def cleanup_task_artifact_directory(task_id: int) -> None:
+    """Remove only the exact private output directory for a completed task."""
+    target = _require_exact_task_directory(task_id, must_exist=False)
+    if not target.exists():
+        return
+    try:
+        shutil.rmtree(target)
+    except OSError as exc:
+        raise ArtifactError(f"Cannot remove task artifact directory: {exc}") from exc
+
+
+def is_explicit_artifact_request(text: str) -> bool:
+    """Whether the user explicitly requested a file or image in Telegram."""
+    return bool(_EXPLICIT_ARTIFACT_RE.search(text))
+
+
+def _limits() -> tuple[int, int]:
+    max_files = max(1, int(settings.artifact_max_files))
+    max_size = max(1, int(settings.artifact_max_size_mb)) * 1024 * 1024
+    return max_files, max_size
+
+
+def _collect_task_artifacts_sync(task_id: int) -> ArtifactCollection:
+    """Walk only one output tree, never following symlinks or special files."""
+    target = _require_exact_task_directory(task_id, must_exist=True)
+    max_files, max_size = _limits()
+    files: list[TaskArtifact] = []
+    skipped: list[str] = []
+    stack: list[tuple[Path, int]] = [(target, 0)]
+
+    while stack:
+        directory, depth = stack.pop()
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as exc:
+            skipped.append(f"не удалось прочитать каталог: {exc}")
+            continue
+        for entry in entries:
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError:
+                skipped.append(f"не удалось проверить: {entry.name}")
+                continue
+            if stat.S_ISLNK(metadata.st_mode):
+                skipped.append(f"пропущена символическая ссылка: {entry.name}")
+                continue
+            entry_path = Path(entry.path)
+            if stat.S_ISDIR(metadata.st_mode):
+                if depth >= _MAX_ARTIFACT_DEPTH:
+                    skipped.append(f"слишком глубокий каталог: {entry.name}")
+                else:
+                    stack.append((entry_path, depth + 1))
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                skipped.append(f"пропущен не-обычный файл: {entry.name}")
+                continue
+            try:
+                relative = entry_path.relative_to(target).as_posix()
+            except ValueError:
+                skipped.append(f"пропущен путь вне задачи: {entry.name}")
+                continue
+            if len(relative) > _MAX_ARTIFACT_PATH_LENGTH:
+                skipped.append(f"слишком длинный путь: {entry.name}")
+                continue
+            if metadata.st_size > max_size:
+                skipped.append(f"превышен размер файла: {relative}")
+                continue
+            if len(files) >= max_files:
+                skipped.append("превышен лимит количества файлов")
+                continue
+            files.append(
+                TaskArtifact(
+                    path=entry_path,
+                    relative_path=relative,
+                    size_bytes=metadata.st_size,
+                )
+            )
+    return ArtifactCollection(tuple(files), tuple(skipped))
+
+
+async def collect_task_artifacts(task_id: int) -> ArtifactCollection:
+    """Collect only the files produced by this task in a worker thread."""
+    return await asyncio.to_thread(_collect_task_artifacts_sync, task_id)
+
+
+async def deliver_task_artifacts(
+    bot: Bot,
+    chat_id: int,
+    artifacts: ArtifactCollection,
+    *,
+    thread_id: int | None = None,
+    rollback_list: list[int] | None = None,
+) -> ArtifactDeliveryReport:
+    """Send files as photos where appropriate and retain failed output safely."""
+    delivered = 0
+    failed = 0
+    for artifact in artifacts.files:
+        path = artifact.path
+        try:
+            metadata = path.lstat()
+        except OSError:
+            failed += 1
+            logger.warning("Artifact disappeared before Telegram delivery: %s", artifact.relative_path)
+            continue
+        if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            failed += 1
+            logger.warning("Refusing unsafe artifact before Telegram delivery: %s", artifact.relative_path)
+            continue
+
+        message = None
+        suffix = path.suffix.lower()
+        try:
+            if suffix in _IMAGE_EXTENSIONS:
+                try:
+                    message = await bot.send_photo(
+                        chat_id,
+                        FSInputFile(str(path)),
+                        caption=artifact.relative_path,
+                        message_thread_id=thread_id,
+                    )
+                except Exception:
+                    # Telegram rejects some valid image files as photos (for
+                    # example an unsupported animation or dimensions). A
+                    # document fallback preserves the actual generated file.
+                    logger.info(
+                        "Photo delivery failed; retrying artifact as a document: %s",
+                        artifact.relative_path,
+                        exc_info=True,
+                    )
+                    message = await bot.send_document(
+                        chat_id,
+                        FSInputFile(str(path)),
+                        caption=artifact.relative_path,
+                        message_thread_id=thread_id,
+                    )
+            else:
+                message = await bot.send_document(
+                    chat_id,
+                    FSInputFile(str(path)),
+                    caption=artifact.relative_path,
+                    message_thread_id=thread_id,
+                )
+        except Exception:
+            failed += 1
+            logger.exception("Failed to deliver task artifact to Telegram: %s", artifact.relative_path)
+            continue
+
+        delivered += 1
+        if rollback_list is not None and message is not None:
+            rollback_list.append(message.message_id)
+        logger.info("Delivered task artifact to Telegram: %s", artifact.relative_path)
+    return ArtifactDeliveryReport(delivered=delivered, failed=failed)
 
 
 def is_managed_workspace_path(raw_path: str | Path) -> bool:
@@ -50,203 +327,3 @@ def is_managed_workspace_path(raw_path: str | Path) -> bool:
             return True
         except ValueError:
             continue
-    return False
-
-def _is_valid_dir(d: Path) -> bool:
-    name = d.name
-    if name.startswith("."):
-        return False
-    if name in {"node_modules", "__pycache__", "venv", ".venv"}:
-        return False
-    return True
-
-def snapshot_workspaces(target_dirs: list[str]) -> dict[str, float]:
-    """Return ``{absolute_path: mtime}`` for trackable files across workspace and scratchpad directories."""
-    snap: dict[str, float] = {}
-    all_dirs = [Path(d).resolve() for d in target_dirs + _DEFAULT_SCRATCH_DIRS]
-
-    for d in all_dirs:
-        if not d.is_dir():
-            try:
-                d.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                continue
-                
-        for root, dirs, files in os.walk(d):
-            root_path = Path(root)
-            dirs[:] = [sub for sub in dirs if _is_valid_dir(Path(sub))]
-            for fname in files:
-                ext = Path(fname).suffix.lower()
-                if ext in _TRACK_EXT:
-                    fpath = root_path / fname
-                    try:
-                        snap[str(fpath)] = fpath.stat().st_mtime
-                    except OSError:
-                        pass
-    return snap
-
-
-def diff_snapshots(
-    before: dict[str, float], after: dict[str, float]
-) -> list[str]:
-    """Return paths that are new or modified, deduplicated by filename."""
-    changed_paths = [
-        p for p, mt in after.items()
-        if p not in before or before[p] < mt
-    ]
-
-    seen_names: set[str] = set()
-    deduped: list[str] = []
-
-    # Sort workspace paths first
-    changed_paths.sort(key=lambda p: (0 if is_managed_workspace_path(p) else 1, p))
-
-    for p in changed_paths:
-        name = os.path.basename(p)
-        if name not in seen_names:
-            seen_names.add(name)
-            deduped.append(p)
-
-    return deduped
-
-
-def should_deliver(fpath: Path) -> bool:
-    """Check if the file should be delivered to Telegram."""
-    ext = fpath.suffix.lower()
-    
-    # Always deliver explicitly requested file types
-    if ext in _DELIVER_EXT:
-        return True
-        
-    # Always deliver images, but filter out background images later
-    if ext in _IMAGE_EXT:
-        return True
-        
-    # Deliver HTML, CSV, etc ONLY if they are in 'artifacts' or 'output' folders
-    parts = fpath.parts
-    if "artifacts" in parts or "output" in parts or "outputs" in parts:
-        return True
-        
-    return False
-
-
-async def deliver_and_cleanup_artifacts(
-    bot: Bot, 
-    chat_id: int, 
-    files: list[str], 
-    thread_id: int | None = None,
-    rollback_list: list[int] | None = None,
-) -> None:
-    """Send detected artifacts as documents to Telegram without deleting workspace project files."""
-    for fpath_str in files:
-        fpath = Path(fpath_str)
-        if not fpath.exists():
-            continue
-
-        name = fpath.name
-        ext = fpath.suffix.lower()
-        
-        # Decide whether to send to Telegram
-        if should_deliver(fpath):
-            # Skip sending standalone background images to avoid photo spam
-            if ext in _IMAGE_EXT and any(kw in name.lower() for kw in ("bg", "background", "hero")):
-                logger.info("Skipping standalone background image telegram photo spam: %s", name)
-            else:
-                try:
-                    inp = FSInputFile(str(fpath))
-                    msg = await bot.send_document(chat_id, inp, caption=name, message_thread_id=thread_id)
-                    if rollback_list is not None:
-                        rollback_list.append(msg.message_id)
-                    logger.info("Delivered artifact to Telegram: %s", fpath)
-                except Exception:
-                    logger.exception("Failed to deliver artifact %s to Telegram", fpath)
-
-        # ONLY clean up temporary scratchpad files. NEVER delete user's workspace files!
-        if not is_managed_workspace_path(fpath):
-            try:
-                fpath.unlink(missing_ok=True)
-                logger.info("Cleaned up scratchpad file from disk: %s", fpath)
-            except Exception as e:
-                logger.warning("Failed to remove scratch file %s: %s", fpath, e)
-
-
-_IGNORE_DIRS = {
-    ".git", "node_modules", ".venv", "venv", "dist", "build", ".cache",
-    "__pycache__", ".agents", ".antigravity", "vendor", "target",
-}
-
-
-def _is_ignored_dir(path: Path) -> bool:
-    return path.name in _IGNORE_DIRS or path.name.startswith(".") and path.name not in {"."}
-
-
-def _collect_recent_scratch_files_sync(
-    started_at: float,
-    max_depth: int = 3,
-    max_files: int = 200,
-    deadline_seconds: float = 2.0,
-) -> list[str]:
-    """Collect recent scratchpad artifacts with tight depth/count/time limits."""
-    import time
-
-    deadline = time.monotonic() + deadline_seconds
-    found: list[str] = []
-    stack: list[tuple[Path, int]] = [(Path(d), 0) for d in _DEFAULT_SCRATCH_DIRS]
-
-    while stack and len(found) < max_files and time.monotonic() < deadline:
-        root, depth = stack.pop()
-        if not root.is_dir():
-            continue
-        try:
-            entries = list(root.iterdir())
-        except OSError:
-            continue
-        for entry in entries:
-            if len(found) >= max_files or time.monotonic() >= deadline:
-                break
-            try:
-                if entry.is_dir():
-                    if depth < max_depth and not _is_ignored_dir(entry):
-                        stack.append((entry, depth + 1))
-                    continue
-                if entry.suffix.lower() not in _TRACK_EXT:
-                    continue
-                if entry.stat().st_mtime >= started_at:
-                    found.append(str(entry.resolve()))
-            except OSError:
-                continue
-    return found
-
-
-async def collect_task_artifacts(ws_dir: str, started_at: float) -> list[str]:
-    """Collect task artifacts without full workspace os.walk on the event loop.
-
-    Workspace changes come from git status; scratchpad is scanned in a bounded
-    worker-thread pass by mtime/depth/count/time limits.
-    """
-    import asyncio
-
-    from bot.services.git_manager import GitCommandTimeout, git_manager
-
-    workspace_files: list[str] = []
-    try:
-        workspace_files = await git_manager.changed_files_async(ws_dir, timeout=5)
-    except (GitCommandTimeout, TimeoutError):
-        logger.warning("Git changed-files collection timed out for %s", ws_dir)
-    except Exception:
-        logger.exception("Failed to collect git changed files for %s", ws_dir)
-
-    try:
-        scratch_files = await asyncio.to_thread(_collect_recent_scratch_files_sync, started_at)
-    except Exception:
-        logger.exception("Failed to collect scratch artifacts")
-        scratch_files = []
-
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for fpath in workspace_files + scratch_files:
-        name = os.path.basename(fpath)
-        if name not in seen:
-            seen.add(name)
-            deduped.append(fpath)
-    return deduped

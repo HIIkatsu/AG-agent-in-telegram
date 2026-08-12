@@ -2,8 +2,8 @@
 
 The Telegram bot itself retains credentials, the SQLite database and SSH keys.
 The model process sees a fresh mount namespace with only its task workspace,
-the dedicated AGY worker home, read-only bundled skills and a per-task
-capability socket.
+the dedicated AGY worker home (including its native bundled skills), a private
+per-task output directory and a per-task capability socket.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import os
 import stat
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,9 +28,13 @@ _SANDBOX_RUNTIME_DIR = "/opt/ag-worker/runtime"
 _SANDBOX_HOME = "/home/agy"
 _SANDBOX_WORKSPACE = "/workspace"
 _SANDBOX_CAPABILITIES = "/run/ag-capabilities"
+_SANDBOX_ARTIFACTS = "/run/ag-artifacts"
 _SANDBOX_CLIENT_DIR = "/opt/ag-worker-tools"
 _SANDBOX_CLIENT_PATH = "/opt/ag-worker-tools/capability_client.py"
 _SANDBOX_MCP_CONFIG = f"{_SANDBOX_HOME}/.gemini/config/mcp_config.json"
+_SANDBOX_AGY_SCRATCH = f"{_SANDBOX_HOME}/.gemini/antigravity-cli/scratch"
+_SANDBOX_UID = 0
+_SANDBOX_GID = 0
 
 
 class WorkerSandboxError(RuntimeError):
@@ -43,6 +48,7 @@ class SandboxLaunch:
     command: tuple[str, ...]
     env: dict[str, str]
     cwd: str
+    preexec_fn: Callable[[], None] | None = None
 
 
 def _resolved_existing(path: str | Path, label: str, *, executable: bool = False) -> Path:
@@ -67,6 +73,45 @@ def _worker_ids() -> tuple[int, int]:
     if uid <= 0 or gid <= 0:
         raise WorkerSandboxError("AGY worker UID and GID must be non-root positive IDs")
     return uid, gid
+
+
+def worker_skills_directory() -> Path:
+    """Return AGY's native skills directory inside its dedicated home.
+
+    The old implementation mounted a root account's skills tree on top of this
+    path. Bubblewrap then had to create a mount point inside a worker-owned
+    bind mount and failed on several real VPS configurations. Keeping managed
+    skill packages natively in the dedicated worker home avoids that fragile
+    overlay and keeps the packages discoverable by AGY as real skills.
+    """
+    return Path(settings.agy_worker_home).expanduser() / ".gemini/antigravity-cli/skills"
+
+
+def _worker_launch_preexec() -> Callable[[], None] | None:
+    """Run Bubblewrap as the dedicated host worker, never as the bot user.
+
+    Bubblewrap maps the UID of *its caller* into a new user namespace. Starting
+    it as root and then asking for UID 999 creates an unmapped identity on many
+    systems, which cannot access the worker-owned home directory. Dropping to
+    the worker before ``exec(bwrap)`` maps the intended host identity to root
+    *inside* the namespace; root there has no host-root authority and sees only
+    the deliberately mounted files.
+    """
+    uid, gid = _worker_ids()
+    current_uid, current_gid = os.geteuid(), os.getegid()
+    if current_uid == uid and current_gid == gid:
+        return None
+    if current_uid != 0:
+        raise WorkerSandboxError(
+            "Bot service must run as root or as AGY_WORKER_UID to launch Bubblewrap"
+        )
+
+    def drop_privileges() -> None:
+        os.setgroups([])
+        os.setgid(gid)
+        os.setuid(uid)
+
+    return drop_privileges
 
 
 def _require_worker_owned_directory(
@@ -163,8 +208,33 @@ def _worker_home() -> Path:
     return home
 
 
-def _skills_dir() -> Path:
-    return _require_directory(settings.agy_global_skills_dir, "AGY global skills directory")
+def _task_artifact_directory(raw_path: str | Path) -> Path:
+    """Require exactly one worker-owned output directory below the managed root."""
+    raw_target = Path(raw_path).expanduser()
+    try:
+        metadata = raw_target.lstat()
+    except OSError as exc:
+        raise WorkerSandboxError(f"Task artifact directory cannot be inspected: {exc}") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise WorkerSandboxError("Task artifact directory must not be a symbolic link")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise WorkerSandboxError("Task artifact directory is not a directory")
+    try:
+        target = raw_target.resolve(strict=True)
+        root = Path(settings.task_artifacts_dir).expanduser().resolve(strict=True)
+        target.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise WorkerSandboxError(
+            "Task artifact directory is outside TASK_ARTIFACTS_DIR"
+        ) from exc
+    uid, gid = _worker_ids()
+    _require_worker_owned_directory(
+        target,
+        "Task artifact directory",
+        uid=uid,
+        gid=gid,
+    )
+    return target
 
 
 def _worker_python() -> Path:
@@ -263,8 +333,8 @@ def validate_sandbox_configuration() -> None:
     _resolved_existing(settings.agy_sandbox_binary, "Bubblewrap executable", executable=True)
     _agy_source_and_sandbox_path()
     _worker_home()
-    _skills_dir()
     _worker_python()
+    _worker_launch_preexec()
     if not CAPABILITY_CLIENT.is_file():
         raise WorkerSandboxError(f"Capability client is missing: {CAPABILITY_CLIENT}")
 
@@ -286,13 +356,16 @@ def _write_mcp_config(capability_dir: Path) -> Path:
     return target
 
 
-def _write_sandbox_etc(capability_dir: Path, uid: int, gid: int) -> Path:
+def _write_sandbox_etc(capability_dir: Path) -> Path:
     """Create the few non-secret /etc files the isolated runtime needs."""
     target = capability_dir / "etc"
     target.mkdir(mode=0o755, exist_ok=True)
     files = {
-        "passwd": f"agyworker:x:{uid}:{gid}:AGY worker:{_SANDBOX_HOME}:/usr/sbin/nologin\n",
-        "group": f"agyworker:x:{gid}:\n",
+        # Bubblewrap maps the host agyworker identity to namespace root. The
+        # numeric host IDs must never be exposed as a misleading identity
+        # inside the namespace.
+        "passwd": f"agyworker:x:{_SANDBOX_UID}:{_SANDBOX_GID}:AGY worker:{_SANDBOX_HOME}:/usr/sbin/nologin\n",
+        "group": f"agyworker:x:{_SANDBOX_GID}:\n",
         "hosts": "127.0.0.1 localhost\n::1 localhost\n",
         "nsswitch.conf": "passwd: files\ngroup: files\nhosts: files dns\n",
     }
@@ -346,6 +419,7 @@ def build_sandbox_launch(
     *,
     agy_args: list[str],
     execution_dir: str,
+    artifact_dir: str | Path,
     capability_dir: Path,
     capability_token: str,
     thread_id: int | None,
@@ -356,12 +430,11 @@ def build_sandbox_launch(
     validate_sandbox_configuration()
     workspace = prepare_execution_directory(execution_dir)
     worker_home = _worker_home()
-    skills_dir = _skills_dir()
+    artifacts = _task_artifact_directory(artifact_dir)
     _agy_path, sandbox_agy_path, agy_runtime_dir = _agy_source_and_sandbox_path()
     capability_root = _require_directory(capability_dir, "Capability socket directory")
     mcp_config = _write_mcp_config(capability_root)
-    uid, gid = _worker_ids()
-    sandbox_etc = _write_sandbox_etc(capability_root, uid, gid)
+    sandbox_etc = _write_sandbox_etc(capability_root)
     sandbox_agy_args = _sandboxify_agy_arguments(agy_args)
 
     command: list[str] = [
@@ -370,9 +443,9 @@ def build_sandbox_launch(
         "--new-session",
         "--unshare-user",
         "--uid",
-        str(uid),
+        str(_SANDBOX_UID),
         "--gid",
-        str(gid),
+        str(_SANDBOX_GID),
         "--disable-userns",
         "--unshare-pid",
         "--unshare-ipc",
@@ -400,6 +473,9 @@ def build_sandbox_launch(
         "--ro-bind",
         str(capability_root),
         _SANDBOX_CAPABILITIES,
+        "--bind",
+        str(artifacts),
+        _SANDBOX_ARTIFACTS,
         "--dir",
         "/opt",
         "--dir",
@@ -411,11 +487,11 @@ def build_sandbox_launch(
         _SANDBOX_CLIENT_PATH,
         f"{_SANDBOX_CLIENT_DIR}/ag-ssh",
         "--ro-bind",
-        str(skills_dir),
-        f"{_SANDBOX_HOME}/.gemini/antigravity-cli/skills",
-        "--ro-bind",
         str(mcp_config),
         _SANDBOX_MCP_CONFIG,
+        "--bind",
+        str(artifacts),
+        _SANDBOX_AGY_SCRATCH,
     ]
     if agy_runtime_dir is not None:
         command.extend(
@@ -492,6 +568,12 @@ def build_sandbox_launch(
             "--setenv",
             "AGY_TG_THREAD_ID",
             str(thread_id) if thread_id is not None else "",
+            "--setenv",
+            "AGY_ARTIFACT_DIR",
+            _SANDBOX_ARTIFACTS,
+            "--setenv",
+            "TMPDIR",
+            _SANDBOX_ARTIFACTS,
             "--chdir",
             _SANDBOX_WORKSPACE,
             "--",
@@ -503,6 +585,7 @@ def build_sandbox_launch(
         command=tuple(command),
         env=_sandbox_environment(thread_id),
         cwd=str(workspace),
+        preexec_fn=_worker_launch_preexec(),
     )
 
 
@@ -510,6 +593,7 @@ def build_unsandboxed_development_launch(
     *,
     agy_args: list[str],
     execution_dir: str,
+    artifact_dir: str | Path,
     thread_id: int | None,
 ) -> SandboxLaunch:
     """Explicit emergency-only path with a stripped environment, never automatic."""
@@ -517,6 +601,8 @@ def build_unsandboxed_development_launch(
         raise WorkerSandboxError("AGY command cannot be empty")
     env = _sandbox_environment(thread_id)
     env["HOME"] = os.environ.get("HOME", "/root")
+    env["AGY_ARTIFACT_DIR"] = str(artifact_dir)
+    env["TMPDIR"] = str(artifact_dir)
     return SandboxLaunch(command=tuple(agy_args), env=env, cwd=execution_dir)
 
 
@@ -539,9 +625,9 @@ def _bubblewrap_probe_command() -> list[str]:
         "--new-session",
         "--unshare-user",
         "--uid",
-        str(settings.agy_worker_uid),
+        str(_SANDBOX_UID),
         "--gid",
-        str(settings.agy_worker_gid),
+        str(_SANDBOX_GID),
         "--disable-userns",
         "--unshare-pid",
         "--unshare-ipc",
@@ -573,10 +659,17 @@ def _bubblewrap_probe_command() -> list[str]:
 
 
 def _verify_bubblewrap_runtime() -> None:
-    """Run a harmless namespace probe for deployment preflight."""
+    """Run a harmless namespace probe as the actual worker identity."""
     probe = _bubblewrap_probe_command()
     try:
-        result = subprocess.run(probe, capture_output=True, text=True, timeout=10, check=False)
+        result = subprocess.run(
+            probe,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            preexec_fn=_worker_launch_preexec(),
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise WorkerSandboxError(f"Bubblewrap probe failed: {exc}") from exc
     if result.returncode != 0:
