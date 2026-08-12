@@ -101,10 +101,16 @@ class TelegramRateLimiter:
         async with self._lock:
             now = time.monotonic()
             cooldown = self._cooldown_until.get(key, 0.0)
-            last = self._last_edit.get(key, 0.0)
+            # ``0.0`` is a real-looking timestamp while a process is young:
+            # on a fresh CI runner ``time.monotonic()`` can still be below the
+            # configured interval.  Only throttle an edit when this message
+            # has actually been edited before.
+            last = self._last_edit.get(key)
             wait_for = max(0.0, cooldown - now)
             if not final and not force:
-                if wait_for > 0 or now - last < self.min_interval:
+                if wait_for > 0 or (
+                    last is not None and now - last < self.min_interval
+                ):
                     return False
 
         if wait_for > 0:
