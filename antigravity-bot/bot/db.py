@@ -62,6 +62,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     retry_of_task_id INTEGER
 );
 
+CREATE INDEX IF NOT EXISTS idx_tasks_thread_status_id
+    ON tasks(thread_id, status, id);
+
 CREATE TABLE IF NOT EXISTS task_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id INTEGER NOT NULL,
@@ -194,8 +197,17 @@ class Database:
         self._conn = await aiosqlite.connect(self._path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL")
+        await self._conn.execute("PRAGMA busy_timeout=5000")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.executescript(_CREATE_TABLES)
+        await self._deduplicate_running_tasks()
+        await self._conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_one_running_per_thread
+                ON tasks(thread_id)
+                WHERE status = 'running'
+            """
+        )
         await self._conn.commit()
 
     async def close(self) -> None:
@@ -203,6 +215,32 @@ class Database:
         self._conn = None
         if connection:
             await connection.close()
+
+    async def _deduplicate_running_tasks(self) -> None:
+        """Make old pre-constraint rows compatible with one active task per thread."""
+        assert self._conn
+        await self._conn.execute(
+            """
+            UPDATE tasks
+            SET
+                status = 'interrupted',
+                finished_at = COALESCE(finished_at, ?),
+                error = COALESCE(error, ?),
+                result_summary = COALESCE(result_summary, ?)
+            WHERE status = 'running'
+              AND id NOT IN (
+                SELECT MAX(id)
+                FROM tasks
+                WHERE status = 'running'
+                GROUP BY thread_id
+              )
+            """,
+            (
+                _now(),
+                "Duplicate running task recovered during startup",
+                "Bot restarted",
+            ),
+        )
 
     # ------------------------------------------------------------------
     # session CRUD

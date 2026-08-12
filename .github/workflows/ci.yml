@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            antigravity-bot/requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r antigravity-bot/requirements.txt -r requirements-dev.txt
+
+      - name: Compile Python sources
+        run: PYTHONPATH=antigravity-bot python -m compileall -q antigravity-bot/bot tests
+
+      - name: Run tests with coverage
+        run: PYTHONPATH=antigravity-bot python -m pytest -q --cov=bot --cov-fail-under=30 --cov-report=term-missing --cov-report=xml:coverage.xml
+
+      - name: Check fatal Ruff diagnostics
+        run: ruff check --select E9,F antigravity-bot tests
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-python-3.12
+          path: coverage.xml
+          if-no-files-found: ignore

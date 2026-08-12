@@ -147,6 +147,9 @@ async def cb_view_diff(cq: CallbackQuery, bot: Bot) -> None:
             if not workspace:
                 await cq.answer("Изолированный workspace задачи не найден", show_alert=True)
                 return
+            if cq.message.message_thread_id != workspace.thread_id:
+                await cq.answer("Задача не принадлежит этому проекту.", show_alert=True)
+                return
             thread_id = workspace.thread_id
             raw_diff = await task_workspace_manager.diff(task_id)
             title = f"Task {task_id}"
@@ -203,6 +206,9 @@ async def cb_accept_diff(cq: CallbackQuery, bot: Bot) -> None:
     if not workspace:
         await cq.answer("Изолированный workspace задачи не найден", show_alert=True)
         return
+    if cq.message.message_thread_id != workspace.thread_id:
+        await cq.answer("Задача не принадлежит этому проекту.", show_alert=True)
+        return
     try:
         changed = await task_workspace_manager.accept(task_id)
     except TaskWorkspaceConflict as exc:
@@ -250,6 +256,9 @@ async def cb_rollback(cq: CallbackQuery, bot: Bot) -> None:
     if not workspace:
         await cq.answer("Изолированный workspace задачи не найден", show_alert=True)
         return
+    if cq.message.message_thread_id != workspace.thread_id:
+        await cq.answer("Задача не принадлежит этому проекту.", show_alert=True)
+        return
     try:
         await task_workspace_manager.discard(task_id)
     except TaskWorkspaceError as exc:
@@ -289,17 +298,36 @@ async def cb_unsafe_legacy_git_action(cq: CallbackQuery) -> None:
 async def cb_cancel_task(cq: CallbackQuery) -> None:
     assert cq.message
     from bot.handlers.message import _active_tasks
-    from bot.services.task_service import cancel_task
+    from bot.services.task_service import (
+        TaskStatus,
+        cancel_task,
+        get_task,
+        stop_task_and_queue,
+    )
 
     thread_id = cq.message.message_thread_id  # type: ignore[union-attr]
     if thread_id is None:
         await cq.answer("Нечего отменять")
         return
 
-    parts = cq.data.split(":")
-    task_id = int(parts[-1])
-    
-    # Check if running
+    try:
+        task_id = int(cq.data.split(":")[-1])  # type: ignore[union-attr]
+    except ValueError:
+        await cq.answer("Некорректный ID задачи", show_alert=True)
+        return
+    task = await get_task(task_id, thread_id=thread_id)
+    if not task:
+        await cq.answer("Задача не принадлежит этому проекту.", show_alert=True)
+        return
+
+    if cq.data.startswith("t:st:"):  # type: ignore[union-attr]
+        transition = await stop_task_and_queue(task_id, thread_id=thread_id)
+    else:
+        transition = await cancel_task(task_id, thread_id=thread_id)
+    if transition.status is not TaskStatus.CANCELLED:
+        await cq.answer("Задача уже завершена.", show_alert=True)
+        return
+
     entry = _active_tasks.get(thread_id)
     if entry:
         tracker, agy_task = entry
@@ -311,14 +339,10 @@ async def cb_cancel_task(cq: CallbackQuery) -> None:
                     await agy_task
                 except asyncio.CancelledError:
                     pass
-            from bot.services.task_service import cancel_queue
-            await cancel_queue(thread_id)
             await cq.answer("Текущая генерация и вся очередь отменены!")
             return
-            
-    # If not running, just cancel in DB
-    await cancel_task(task_id)
-    await cq.answer("Задача отменена!")
+
+    await cq.answer("Задача отменена.")
 
 
 @router.callback_query(F.data == "cancel_gen")
@@ -330,7 +354,17 @@ async def cb_cancel_gen_legacy(cq: CallbackQuery) -> None:
 async def cb_task_status(cq: CallbackQuery) -> None:
     assert cq.message
     from bot.handlers.ide import build_task_card
-    task_id = int(cq.data.split(":")[-1])  # type: ignore[union-attr]
+    from bot.services.task_service import get_task
+
+    try:
+        task_id = int(cq.data.split(":")[-1])  # type: ignore[union-attr]
+    except ValueError:
+        await cq.answer("Некорректный ID задачи", show_alert=True)
+        return
+    thread_id = cq.message.message_thread_id
+    if thread_id is None or not await get_task(task_id, thread_id=thread_id):
+        await cq.answer("Задача не принадлежит этому проекту.", show_alert=True)
+        return
     text, kb = await build_task_card(task_id)
     try:
         await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
@@ -342,11 +376,27 @@ async def cb_task_status(cq: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("t:rt:") | F.data.startswith("retry_task:"))
 async def cb_retry_task(cq: CallbackQuery, bot: Bot) -> None:
     assert cq.message
-    from bot.services.task_service import enqueue_task, get_task
-    task_id = int(cq.data.split(":")[-1])  # type: ignore[union-attr]
-    task = await get_task(task_id)
+    from bot.services.task_service import TaskStatus, enqueue_task, get_task
+
+    try:
+        task_id = int(cq.data.split(":")[-1])  # type: ignore[union-attr]
+    except ValueError:
+        await cq.answer("Некорректный ID задачи", show_alert=True)
+        return
+    thread_id = cq.message.message_thread_id
+    task = (
+        await get_task(task_id, thread_id=thread_id)
+        if thread_id is not None
+        else None
+    )
     if not task:
         await cq.answer("Задача не найдена", show_alert=True)
+        return
+    if TaskStatus.parse(str(task["status"])) in {
+        TaskStatus.QUEUED,
+        TaskStatus.RUNNING,
+    }:
+        await cq.answer("Эта задача ещё не завершена.", show_alert=True)
         return
     new_id = await enqueue_task(
         thread_id=task["thread_id"],
@@ -366,7 +416,17 @@ async def cb_retry_task(cq: CallbackQuery, bot: Bot) -> None:
 async def cb_view_logs(cq: CallbackQuery) -> None:
     assert cq.message
     import html
-    task_id = int(cq.data.split(":")[-1])  # type: ignore[union-attr]
+    from bot.services.task_service import get_task
+
+    try:
+        task_id = int(cq.data.split(":")[-1])  # type: ignore[union-attr]
+    except ValueError:
+        await cq.answer("Некорректный ID задачи", show_alert=True)
+        return
+    thread_id = cq.message.message_thread_id
+    if thread_id is None or not await get_task(task_id, thread_id=thread_id):
+        await cq.answer("Задача не принадлежит этому проекту.", show_alert=True)
+        return
     cur = await db.conn.execute("SELECT * FROM task_logs WHERE task_id = ? ORDER BY id DESC LIMIT 40", (task_id,))
     rows = [dict(r) for r in await cur.fetchall()]
     if not rows:
@@ -383,7 +443,14 @@ async def cb_view_logs(cq: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("clear_queue:"))
 async def cb_clear_queue(cq: CallbackQuery) -> None:
     from bot.services.task_service import cancel_queue
-    thread_id = int(cq.data.split(":")[1])
+    try:
+        thread_id = int(cq.data.split(":")[1])  # type: ignore[union-attr]
+    except (IndexError, ValueError):
+        await cq.answer("Некорректный проект.", show_alert=True)
+        return
+    if cq.message is None or cq.message.message_thread_id != thread_id:
+        await cq.answer("Очередь другого проекта менять нельзя.", show_alert=True)
+        return
     await cancel_queue(thread_id)
     await cq.answer("Очередь очищена!")
 

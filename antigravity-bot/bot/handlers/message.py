@@ -278,6 +278,21 @@ async def _process(
 _active_tasks: dict[int, tuple[TaskTracker, asyncio.Task | None]] = {}
 
 
+def _tracker_finish_status(status: object) -> str:
+    """Map durable queue states to the task-card renderer's display states."""
+    from bot.services.task_service import TaskStatus
+
+    resolved = TaskStatus.parse(status)
+    return {
+        TaskStatus.DONE: "DONE",
+        TaskStatus.FAILED: "ERROR",
+        TaskStatus.ERROR: "ERROR",
+        TaskStatus.CANCELLED: "CANCELLED",
+        TaskStatus.TIMEOUT: "TIMEOUT",
+        TaskStatus.INTERRUPTED: "INTERRUPTED",
+    }.get(resolved, "ERROR")
+
+
 def _start_queue_processing(thread_id: int, bot: Bot, chat_id: int) -> bool:
     """Start one queue runner per thread and report whether it was started."""
     if thread_id in _queue_loops:
@@ -289,14 +304,12 @@ def _start_queue_processing(thread_id: int, bot: Bot, chat_id: int) -> bool:
 
 async def resume_queue_processing(thread_id: int, bot: Bot, chat_id: int) -> None:
     """Resume queued work after a task workspace has been finalized."""
-    for _ in range(100):
-        if thread_id not in _queue_loops:
-            break
+    while thread_id in _queue_loops:
         await asyncio.sleep(0.05)
     _start_queue_processing(thread_id, bot, chat_id)
 
 async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
-    from bot.services.task_service import pop_next_task, finish_task
+    from bot.services.task_service import TaskStatus, finish_task, pop_next_task
     from bot.services.task_service import log_task_event
     from bot.services.task_workspace import task_workspace_manager
     from bot.services.tracker import thread_messages_registry
@@ -317,7 +330,12 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
             
             session = await db.get_session(thread_id)
             if not session:
-                break
+                await finish_task(
+                    task_id,
+                    TaskStatus.FAILED,
+                    error="Project session was removed before task execution",
+                )
+                continue
                 
             ws = session["workdir"]
             if not os.path.isdir(ws) and not session.get("is_mounted"):
@@ -331,14 +349,25 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
             _NAMESPACE_TG = _uuid.UUID('6ba7b810-9ed0-11d1-80b4-00c04fd430c8')
             conversation_id = str(_uuid.uuid5(_NAMESPACE_TG, f"thread-{thread_id}"))
 
-            stop_typing = asyncio.Event()
-            typing_task = asyncio.create_task(_typing_loop(bot, chat_id, stop_typing, thread_id))
+            try:
+                status_msg = await bot.send_message(
+                    chat_id,
+                    f"<b>{'⚡ Chat' if execution_profile == 'chat' else '🛠 Code task'}</b>\n└─ [⠋] Обработка...",
+                    parse_mode="HTML",
+                    message_thread_id=thread_id,
+                )
+            except Exception as exc:
+                logger.exception("Failed to create status message for task #%s", task_id)
+                await finish_task(
+                    task_id,
+                    TaskStatus.FAILED,
+                    error=f"Could not create Telegram task status message: {exc}",
+                )
+                continue
 
-            status_msg = await bot.send_message(
-                chat_id, 
-                f"<b>{'⚡ Chat' if execution_profile == 'chat' else '🛠 Code task'}</b>\n└─ [⠋] Обработка...",
-                parse_mode="HTML",
-                message_thread_id=thread_id
+            stop_typing = asyncio.Event()
+            typing_task = asyncio.create_task(
+                _typing_loop(bot, chat_id, stop_typing, thread_id)
             )
             
             t_reg = thread_messages_registry.setdefault(thread_id, [])
@@ -377,15 +406,23 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 except Exception as exc:
                     logger.exception("Failed to prepare isolated workspace for task #%s", task_id)
                     await tracker.on_tool_end("task_workspace", "ERROR")
-                    await finish_task(task_id, "failed", error=str(exc))
+                    final_status = await finish_task(
+                        task_id,
+                        TaskStatus.FAILED,
+                        error=str(exc),
+                    )
                     stop_typing.set()
                     typing_task.cancel()
                     _active_tasks.pop(thread_id, None)
-                    await tracker.finish("ERROR")
+                    await tracker.finish(_tracker_finish_status(final_status.status))
                     await asyncio.sleep(0.5)
                     continue
                 if tracker.cancelled:
-                    await finish_task(task_id, "cancelled", error="Cancelled by user")
+                    final_status = await finish_task(
+                        task_id,
+                        TaskStatus.CANCELLED,
+                        error="Cancelled by user",
+                    )
                     stop_typing.set()
                     typing_task.cancel()
                     _active_tasks.pop(thread_id, None)
@@ -399,6 +436,7 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                         logger.exception(
                             "Failed to clean cancelled task workspace #%s", task_id
                         )
+                    await tracker.finish(_tracker_finish_status(final_status.status))
                     await asyncio.sleep(0.5)
                     continue
             agy_task: asyncio.Task | None = None
@@ -420,16 +458,36 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 ))
                 _active_tasks[thread_id] = (tracker, agy_task)
                 full_response = await agy_task
-                task_status = "timeout" if "Превышен таймаут" in full_response else "done"
-                await finish_task(task_id, task_status, result_summary=full_response[:1000])
+                target_status = (
+                    TaskStatus.TIMEOUT
+                    if "Превышен таймаут" in full_response
+                    else TaskStatus.DONE
+                )
+                task_status = (
+                    await finish_task(
+                        task_id,
+                        target_status,
+                        result_summary=full_response[:1000],
+                    )
+                ).status
             except asyncio.CancelledError:
                 full_response = ""
-                task_status = "cancelled"
-                await finish_task(task_id, "cancelled", error="Cancelled by user")
+                task_status = (
+                    await finish_task(
+                        task_id,
+                        TaskStatus.CANCELLED,
+                        error="Cancelled by user",
+                    )
+                ).status
             except Exception as exc:
                 full_response = ""
-                task_status = "failed"
-                await finish_task(task_id, "failed", error=str(exc))
+                task_status = (
+                    await finish_task(
+                        task_id,
+                        TaskStatus.FAILED,
+                        error=str(exc),
+                    )
+                ).status
             finally:
                 stop_typing.set()
                 typing_task.cancel()
@@ -464,7 +522,7 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                     await task_workspace_manager.mark_pending(task_id)
                     await log_task_event(task_id, "error", "Could not render task diff", str(exc))
 
-            await tracker.finish("TIMEOUT" if task_status == "timeout" else "ERROR" if task_status == "failed" else "CANCELLED" if task_status == "cancelled" else "DONE")
+            await tracker.finish(_tracker_finish_status(task_status))
 
             if execution_profile == "chat":
                 await asyncio.sleep(0.5)

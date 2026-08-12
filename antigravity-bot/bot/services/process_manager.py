@@ -1,12 +1,12 @@
 """Process Manager for handling background processes and tunnels."""
 
 import asyncio
+import logging
 import os
 import re
 import signal
-import subprocess
+
 from bot.db import db
-import logging
 
 logger = logging.getLogger(__name__)
 
