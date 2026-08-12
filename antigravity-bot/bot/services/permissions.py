@@ -72,6 +72,8 @@ class PermissionHandler:
         parameters: dict[str, Any],
         proc: Any | None = None,
         thread_id: int | None = None,
+        force_approval: bool = False,
+        timeout_seconds: float | None = None,
     ) -> bool:
         """Handle tool permission. Auto-approves routine tools immediately.
         
@@ -83,7 +85,7 @@ class PermissionHandler:
             logger.info("Auto-denying blocking web server command to prevent hanging: %s", parameters)
             return False
 
-        if not self.is_strictly_dangerous(tool_name, parameters):
+        if not force_approval and not self.is_strictly_dangerous(tool_name, parameters):
             return True
 
         req_id = str(uuid.uuid4())[:8]
@@ -134,6 +136,8 @@ class PermissionHandler:
             req.message_id = msg.message_id
         except Exception:
             logger.exception("Failed to send permission message")
+            async with self._lock:
+                self._requests.pop(req_id, None)
             if proc and hasattr(proc, "pid") and proc.pid:
                 try:
                     os.kill(proc.pid, signal.SIGCONT)
@@ -141,8 +145,28 @@ class PermissionHandler:
                     pass
             return False
 
-        # 3. Wait for user decision via CallbackQuery
-        await event.wait()
+        # 3. Wait for user decision via CallbackQuery. Capability operations
+        # such as SSH use a bounded wait so a killed sandbox client cannot leave
+        # a permanent approval request behind.
+        try:
+            if timeout_seconds is None:
+                await event.wait()
+            else:
+                await asyncio.wait_for(event.wait(), timeout=timeout_seconds)
+        except TimeoutError:
+            async with self._lock:
+                self._requests.pop(req_id, None)
+            if req.message_id:
+                try:
+                    await bot.edit_message_text(
+                        f"⌛ <b>Время подтверждения истекло</b> (<code>{req.tool_name}</code>)",
+                        chat_id=req.chat_id,
+                        message_id=req.message_id,
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+            return False
 
         async with self._lock:
             self._requests.pop(req_id, None)
@@ -206,6 +230,12 @@ class PermissionHandler:
     def _format_details(self, tool_name: str, parameters: dict[str, Any]) -> str:
         if tool_name == "run_command":
             return str(parameters.get("CommandLine", ""))
+        if tool_name == "ssh_exec":
+            environment = parameters.get("environment", "")
+            command = parameters.get("command", "")
+            cwd = parameters.get("cwd")
+            cwd_line = f"\nКаталог: {cwd}" if cwd else ""
+            return f"SSH environment: {environment}\nКоманда: {command}{cwd_line}"
         if tool_name in ("write_to_file", "replace_file_content", "multi_replace_file_content"):
             return f"Файл: {parameters.get('TargetFile', parameters.get('path', ''))}"
         return str(parameters)[:300]

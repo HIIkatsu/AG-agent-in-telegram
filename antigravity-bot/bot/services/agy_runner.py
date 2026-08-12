@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import signal
-import sys
 import tempfile
 from collections.abc import Awaitable, Callable
 
@@ -19,12 +18,17 @@ from bot.services.global_memory import (
     load_global_memory_snapshot,
 )
 from bot.services.instructions import (
-    BOT_ROOT,
     InstructionBundle,
     get_instruction_bundle,
 )
+from bot.services.capability_broker import CapabilityBrokerError, TaskCapabilityBroker
 from bot.services.permissions import permission_handler
 from bot.services.tracker import TaskTracker
+from bot.services.worker_sandbox import (
+    WorkerSandboxError,
+    build_sandbox_launch,
+    build_unsandboxed_development_launch,
+)
 from bot.utils.sanitizer import IncrementalStreamDecoder
 
 logger = logging.getLogger(__name__)
@@ -65,6 +69,10 @@ _BASE_RUNTIME_RULES = """\
   через python -c. Для работы с памятью используй нативные инструменты
   save_memory, list_memory и delete_memory. Исключение — только явно поставленная
   задача на разработку, миграцию или отладку самой БД этого бота.
+- Ты работаешь в изолированной task-песочнице. Не пытайся обходить её, искать
+  системные секреты или прямые SSH-ключи. Для удалённых серверов используй только
+  skill remote-environments и команду ag-ssh; каждая SSH-команда подтверждается
+  пользователем в Telegram.
 
 ## Behavior
 - Если пользователь задаёт вопрос — отвечай текстом, НЕ создавая файлы.
@@ -221,34 +229,57 @@ async def run_agy(
     )
     await _log_runtime_context(tracker, instructions_sha256, memory)
 
-    project_id_str = ""
-    if thread_id is not None:
-        from bot.db import db
-        session = await db.get_session(thread_id)
-        if session and session.get("project_id"):
-            project_id_str = str(session["project_id"])
+    broker: TaskCapabilityBroker | None = None
+    try:
+        broker = TaskCapabilityBroker(
+            bot=bot,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            task_id=tracker.task_id if tracker else None,
+            worker_uid=settings.agy_worker_uid,
+            worker_gid=settings.agy_worker_gid,
+        )
+        endpoint = await broker.start()
+        launch = build_sandbox_launch(
+            agy_args=cmd,
+            execution_dir=execution_dir,
+            capability_dir=endpoint.mount_dir,
+            capability_token=endpoint.token,
+            thread_id=thread_id,
+        )
+    except (CapabilityBrokerError, WorkerSandboxError) as exc:
+        if broker is not None:
+            await broker.close()
+        if not settings.agy_allow_unsandboxed_dev:
+            logger.error("Refusing unsandboxed AGY task: %s", exc)
+            sandbox_message = (
+                "\n\n❌ <b>Песочница AGY не готова.</b>\n"
+                "Запуск агента остановлен безопасно; проверьте настройку worker sandbox.\n"
+                f"<code>{exc}</code>"
+            )
+            await on_chunk(sandbox_message)
+            return sandbox_message
+        logger.critical("Running AGY without sandbox because AGY_ALLOW_UNSANDBOXED_DEV=true: %s", exc)
+        launch = build_unsandboxed_development_launch(
+            agy_args=cmd,
+            execution_dir=execution_dir,
+            thread_id=thread_id,
+        )
 
-    env = {
-        **os.environ,
-        "TERM": "dumb", "NO_COLOR": "1",
-        "LANG": "ru_RU.UTF-8", "LC_ALL": "ru_RU.UTF-8",
-        "PYTHONIOENCODING": "utf-8",
-        "AGY_BOT_ROOT": str(BOT_ROOT),
-        "AGY_BOT_PYTHON": sys.executable,
-        "AGY_BOT_DB_PATH": settings.db_path,
-        "AGY_TG_THREAD_ID": str(thread_id) if thread_id is not None else "",
-        "AGY_TG_PROJECT_ID": project_id_str,
-    }
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=execution_dir,
-        env=env,
-        start_new_session=True,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *launch.command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=launch.cwd,
+            env=launch.env,
+            start_new_session=True,
+        )
+    except Exception:
+        if broker is not None:
+            await broker.close()
+        raise
 
     decoder = IncrementalStreamDecoder("utf-8", errors="replace")
     full_response = ""
@@ -413,6 +444,9 @@ async def run_agy(
         err_msg = f"\n\n❌ **Ошибка выполнения:**\n```\n{exc}\n```"
         full_response += err_msg
         await on_chunk(err_msg)
+    finally:
+        if broker is not None:
+            await broker.close()
 
     logger.info("agy finished: %d chars response", len(full_response))
     return full_response

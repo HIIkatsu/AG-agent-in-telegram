@@ -79,6 +79,23 @@ def test_global_memory_skill_uses_native_memory_tools() -> None:
     assert "bot.services.memory_tools" not in skill
 
 
+def test_remote_environment_skill_remains_a_skill_and_uses_brokered_ssh() -> None:
+    skill = (
+        ROOT
+        / "antigravity-bot"
+        / ".agents"
+        / "skills"
+        / "remote-environments"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    assert "name: remote-environments" in skill
+    assert "ag-ssh exec" in skill
+    assert "Telegram confirmation" in skill
+    assert "AGY_BOT_ROOT" not in skill
+    assert "bot.services.ssh_tool" not in skill
+
+
 def test_registry_installs_the_complete_bundled_library(tmp_path: Path) -> None:
     source = ROOT / "antigravity-bot" / ".agents" / "skills"
     target = tmp_path / "global"

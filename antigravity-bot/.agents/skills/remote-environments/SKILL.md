@@ -5,8 +5,9 @@ description: Lists configured SSH environments, exposes the bot public key, and 
 
 # Remote Environments
 
-Use the bot-owned SSH broker instead of reading credentials or opening an unrelated
-direct SSH session. The runner provides `AGY_BOT_ROOT` and `AGY_BOT_PYTHON`.
+Use the task-scoped `ag-ssh` capability broker instead of reading credentials or
+opening an unrelated direct SSH session. The sandbox never exposes the bot source,
+database or private SSH keys to the agent.
 
 ## Safety rules
 
@@ -15,18 +16,20 @@ direct SSH session. The runner provides `AGY_BOT_ROOT` and `AGY_BOT_PYTHON`.
 3. Pass the environment, command, and working directory as separate shell arguments.
 4. Do not reveal private keys, tokens, passwords, or secret file contents.
 5. Never shut down a machine unless the user directly asks to shut it down.
-6. Report the remote exit code and any relevant error; do not claim success on failure.
+6. Every remote command requires a Telegram confirmation from the user. Wait for
+   that confirmation; do not claim success on failure or denial.
+7. Report the remote exit code and any relevant error; do not claim success on failure.
 
 ## Commands
 
 ```bash
-PYTHONPATH="$AGY_BOT_ROOT" "$AGY_BOT_PYTHON" -m bot.services.ssh_tool list
-PYTHONPATH="$AGY_BOT_ROOT" "$AGY_BOT_PYTHON" -m bot.services.ssh_tool pubkey
-PYTHONPATH="$AGY_BOT_ROOT" "$AGY_BOT_PYTHON" -m bot.services.ssh_tool exec "environment name" "command" --cwd "/remote/path"
+ag-ssh list
+ag-ssh pubkey
+ag-ssh exec "environment name" "command" --cwd "/remote/path"
 ```
 
 For an explicitly requested soft shutdown:
 
 ```bash
-PYTHONPATH="$AGY_BOT_ROOT" "$AGY_BOT_PYTHON" -m bot.services.power_tool shutdown "environment name"
+ag-ssh exec "environment name" "sudo shutdown -h now"
 ```

@@ -27,6 +27,20 @@ class Settings(BaseSettings):
     agy_path: str = "/root/.local/bin/agy"
     agy_global_skills_dir: str = "~/.gemini/antigravity-cli/skills"
     agy_mcp_config_path: str = "~/.gemini/config/mcp_config.json"
+    # AGY always runs in a fail-closed Bubblewrap worker. The dedicated worker
+    # home may contain only the CLI's own authentication/runtime state; bot
+    # tokens, SQLite data and SSH keys are never mounted there.
+    agy_sandbox_binary: str = "/usr/bin/bwrap"
+    agy_sandbox_python_path: str = "/usr/bin/python3"
+    agy_worker_home: str = "/opt/antigravity-bot/agy-worker-home"
+    # A dedicated, read-only CLI runtime. AGY_PATH must either live below this
+    # directory or be a system executable below /usr; never point it into the
+    # bot service account's home directory when the sandbox is enabled.
+    agy_worker_runtime_dir: str = "/opt/antigravity-bot/agy-worker-runtime"
+    agy_worker_uid: int = 65534
+    agy_worker_gid: int = 65534
+    agy_capability_socket_dir: str = "/tmp/antigravity-capabilities"
+    agy_allow_unsandboxed_dev: bool = False
     workspaces_dir: str = "/tmp/workspaces"
     task_workspaces_dir: str = "/tmp/antigravity-task-workspaces"
     db_path: str = "/opt/antigravity-bot/data/bot.db"
@@ -38,6 +52,10 @@ class Settings(BaseSettings):
     agy_print_timeout: str = "10m0s"
     permissions_mode: str = "skip"  # skip, ask, deny-dangerous
     dangerously_skip_permissions: bool = True
+    ssh_key_path: str = "/opt/antigravity-bot/.ssh/bot_ed25519"
+    ssh_known_hosts_path: str = "/opt/antigravity-bot/.ssh/known_hosts"
+    ssh_command_timeout_seconds: int = 120
+    ssh_approval_timeout_seconds: int = 120
 
     @property
     def allowed_ids(self) -> list[int]:
