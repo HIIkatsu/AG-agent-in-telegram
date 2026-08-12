@@ -289,7 +289,6 @@ async def run_agy(
             cwd=launch.cwd,
             env=launch.env,
             start_new_session=True,
-            preexec_fn=getattr(launch, "preexec_fn", None),
         )
     except Exception:
         if broker is not None:

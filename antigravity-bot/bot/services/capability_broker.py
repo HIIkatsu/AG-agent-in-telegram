@@ -124,19 +124,15 @@ class TaskCapabilityBroker:
             return self.endpoint
         root = Path(settings.agy_capability_socket_dir).expanduser().resolve()
         try:
-            root.mkdir(parents=True, exist_ok=True, mode=0o711)
-            # Bubblewrap itself is execed as the non-root worker. It must be
-            # able to traverse this root to bind its one unpredictable task
-            # endpoint, but it cannot list sibling endpoints. The bearer token
-            # remains mandatory for every request.
-            os.chmod(root, 0o711)
+            # Bubblewrap is launched by the trusted root-owned bot service.
+            # Keep the parent private: the non-root AGY process receives only
+            # its already-mounted child endpoint, never this host directory.
+            root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(root, 0o700)
             mount_dir = Path(tempfile.mkdtemp(prefix="task-capability-", dir=root))
-            # The worker cannot list the 0711 parent but can traverse to its
-            # own socket.
-            # The mount namespace can remap user IDs, so socket authorization
-            # cannot rely on Unix ownership. A high-entropy per-task token is
-            # mandatory for every request; the random path plus the unlistable
-            # parent directory are a second containment layer.
+            # The sandbox bind-mounts this child directly. The capability token
+            # remains mandatory for every request; the random path is a second
+            # containment layer and the worker never sees the host parent.
             os.chmod(mount_dir, 0o711)
             socket_path = mount_dir / "broker.sock"
             server = await asyncio.start_unix_server(self._handle_client, path=socket_path)
