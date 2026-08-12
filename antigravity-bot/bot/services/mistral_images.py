@@ -8,6 +8,8 @@ bytes directly into that task's already allocated artifact directory.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import os
@@ -25,6 +27,10 @@ logger = logging.getLogger(__name__)
 
 _MAX_PROMPT_CHARS = 8_000
 _IMAGE_URL_RE = re.compile(r"https://[^\s\]>)\"']+", re.IGNORECASE)
+_DATA_IMAGE_RE = re.compile(
+    r"data:(image/(?:png|jpeg|webp|gif|bmp));base64,([A-Za-z0-9+/=\s]+)",
+    re.IGNORECASE,
+)
 _IMAGE_SUFFIXES = {
     "image/png": ".png",
     "image/jpeg": ".jpg",
@@ -84,6 +90,42 @@ def _find_image_urls(value: object) -> list[str]:
         if url not in unique:
             unique.append(url)
     return unique
+
+
+def _find_inline_images(value: object) -> list[tuple[bytes, str]]:
+    """Extract base64/data-URL images returned instead of downloadable URLs."""
+    found: list[tuple[bytes, str]] = []
+
+    def append_data(content_type: str, raw_b64: str) -> None:
+        try:
+            data = base64.b64decode("".join(raw_b64.split()), validate=True)
+        except (binascii.Error, ValueError):
+            return
+        if data and _looks_like_image(data):
+            found.append((data, content_type.lower()))
+
+    def visit(item: object) -> None:
+        if isinstance(item, str):
+            for match in _DATA_IMAGE_RE.finditer(item):
+                append_data(match.group(1), match.group(2))
+        elif isinstance(item, dict):
+            content_type = str(item.get("mime_type") or item.get("content_type") or "image/png")
+            for key in ("b64_json", "base64", "image_base64", "data"):
+                child = item.get(key)
+                if isinstance(child, str):
+                    data_url = _DATA_IMAGE_RE.search(child)
+                    if data_url:
+                        append_data(data_url.group(1), data_url.group(2))
+                    else:
+                        append_data(content_type, child)
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return found
 
 
 def _safe_image_suffix(content_type: str | None, url: str) -> str:
@@ -228,16 +270,23 @@ class MistralImageClient:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 response = await self._post_completion(session, normalized_prompt)
                 urls = _find_image_urls(response)
-                if not urls:
-                    raise MistralImageError("Mistral did not return an image URL")
-                data, content_type = await self._download_image(session, urls[0])
+                if urls:
+                    data, content_type = await self._download_image(session, urls[0])
+                else:
+                    inline_images = _find_inline_images(response)
+                    if not inline_images:
+                        raise MistralImageError("Mistral did not return an image file")
+                    data, content_type = inline_images[0]
+                    if len(data) > self._max_file_bytes:
+                        raise MistralImageError("Mistral image exceeds the configured artifact size limit")
         except asyncio.TimeoutError as exc:
             raise MistralImageError("Mistral image request timed out") from exc
         except aiohttp.ClientError as exc:
             logger.warning("Mistral image request failed: %s", type(exc).__name__)
             raise MistralImageError("Mistral image request failed") from exc
 
-        filename = f"mistral-image-1{_safe_image_suffix(content_type, urls[0])}"
+        source_url = urls[0] if urls else ""
+        filename = f"mistral-image-1{_safe_image_suffix(content_type, source_url)}"
         path = target / filename
         try:
             file_descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
