@@ -65,7 +65,7 @@ class TaskTracker:
     """Manages static header, active step spinner tree, and smooth text streaming without flickering."""
 
     def __init__(
-        self, bot: Bot, thread_id: int, status_message: Message, ws_dir: str = "", 
+        self, bot: Bot, thread_id: int, status_message: Message | None, ws_dir: str = "",
         debounce: float = 0.4, commit_hash: str | None = None, task_id: int | None = None,
         model: str = "", mode: str = "code", started_at: datetime | None = None
     ):
@@ -109,6 +109,16 @@ class TaskTracker:
         async with self._lock:
             self._buffer += text
 
+    async def replace_text(self, text: str) -> None:
+        """Replace streamed prose when an independently verified result disagrees.
+
+        Tool output is not evidence that a requested image or file exists.  The
+        queue uses this at the terminal boundary so a model cannot claim that a
+        failed generation was delivered successfully.
+        """
+        async with self._lock:
+            self._buffer = text
+
     async def on_tool_start(self, tool_name: str, label: str) -> None:
         """Lifecycle hook when a tool starts executing."""
         async with self._lock:
@@ -141,10 +151,8 @@ class TaskTracker:
         if self.task_id:
             self._pending_log_events.append(("cancelled", "Задача отменена пользователем", None))
             await self._flush_log_events()
-        try:
-            await self.status_msg.edit_text("Генерация отменена.")
-        except Exception:
-            pass
+        if self.status_msg is not None:
+            await self._safe_edit(self.status_msg, "Генерация отменена.", final=True)
 
     async def finish(self, status: str = "DONE") -> None:
         self._finished = True
@@ -169,6 +177,12 @@ class TaskTracker:
         async with self._lock:
             buffer_copy = self._buffer
             steps_copy = list(self.steps)
+
+        # Telegram delivery is intentionally auxiliary to the durable task
+        # queue.  If Telegram is temporarily unavailable at task start, the
+        # task still runs and its DB log remains available for recovery.
+        if self.status_msg is None:
+            return
 
         spinner = _SPINNER[self._spinner_idx % len(_SPINNER)]
 
@@ -249,13 +263,12 @@ class TaskTracker:
                         reply_id = self.status_msg.reply_to_message.message_id if self.status_msg.reply_to_message else None
                         for i, chunk in enumerate(chunks[1:]):
                             part_text = f"{part_label(i + 2, len(chunks))}{chunk}"
-                            msg = await self.bot.send_message(
-                                chat_id=self.status_msg.chat.id,
-                                text=part_text,
+                            msg = await self._send_message(
+                                part_text,
                                 parse_mode="HTML",
                                 disable_web_page_preview=True,
                                 message_thread_id=self.thread_id if self.thread_id else None,
-                                reply_to_message_id=reply_id
+                                reply_to_message_id=reply_id,
                             )
                             sent_msg_ids.append(msg.message_id)
                 except Exception as e:
@@ -279,12 +292,11 @@ class TaskTracker:
                     chunks = chunk_text(clean_text, max_len=4000)
                     if len(clean_text) > 12000:
                         reply_id = self.status_msg.reply_to_message.message_id if self.status_msg.reply_to_message else None
-                        msg1 = await self.bot.send_message(
-                            chat_id=self.status_msg.chat.id,
-                            text=chunks[0] + "\n\n<i>[Ответ слишком длинный, см. файл ниже]</i>",
+                        msg1 = await self._send_message(
+                            chunks[0] + "\n\n<i>[Ответ слишком длинный, см. файл ниже]</i>",
                             parse_mode="HTML",
                             message_thread_id=self.thread_id if self.thread_id else None,
-                            reply_to_message_id=reply_id
+                            reply_to_message_id=reply_id,
                         )
                         sent_msg_ids.append(msg1.message_id)
                         self._schedule_background_task(
@@ -295,13 +307,12 @@ class TaskTracker:
                         reply_id = self.status_msg.reply_to_message.message_id if self.status_msg.reply_to_message else None
                         for i, chunk in enumerate(chunks):
                             text_to_send = f"{part_label(i + 1, len(chunks))}{chunk}"
-                            msg = await self.bot.send_message(
-                                chat_id=self.status_msg.chat.id,
-                                text=text_to_send,
+                            msg = await self._send_message(
+                                text_to_send,
                                 parse_mode="HTML",
                                 disable_web_page_preview=True,
                                 message_thread_id=self.thread_id if self.thread_id else None,
-                                reply_to_message_id=reply_id
+                                reply_to_message_id=reply_id,
                             )
                             sent_msg_ids.append(msg.message_id)
                 except Exception as e:
@@ -361,15 +372,47 @@ class TaskTracker:
         if self.task_id and self._pending_log_events:
             self._schedule_background_task(self._flush_log_events(), label="log_flush")
 
+    async def _send_message(self, text: str, **kwargs) -> Message:
+        """Send a task response through the chat-wide Telegram limiter."""
+        if self.status_msg is None:
+            raise RuntimeError("Task tracker has no Telegram status message")
+        from bot.services.telegram_rate_limiter import telegram_rate_limiter
+
+        async def send() -> Message:
+            return await self.bot.send_message(
+                chat_id=self.status_msg.chat.id,
+                text=text,
+                **kwargs,
+            )
+
+        return await telegram_rate_limiter.request(
+            self.status_msg.chat.id,
+            send,
+            label="task response",
+        )
+
     async def _safe_edit(self, msg: Message, html_text: str, reply_markup: InlineKeyboardMarkup | None = None, final: bool = False, force: bool = False) -> None:
         from bot.services.telegram_rate_limiter import telegram_rate_limiter
         if not await telegram_rate_limiter.allow_edit(msg.chat.id, msg.message_id, final=final, force=force):
             return
         timeout = 12.0 if final or force else 4.0
-        try:
-            await asyncio.wait_for(
-                msg.edit_text(html_text, parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=True),
+
+        async def edit(text: str, *, markup: InlineKeyboardMarkup | None) -> object:
+            return await asyncio.wait_for(
+                msg.edit_text(
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                ),
                 timeout=timeout,
+            )
+
+        try:
+            await telegram_rate_limiter.request(
+                msg.chat.id,
+                lambda: edit(html_text, markup=reply_markup),
+                label="task status edit",
             )
         except asyncio.TimeoutError:
             logger.debug("Telegram edit timed out after %.1fs (final=%s, force=%s)", timeout, final, force)
@@ -378,28 +421,20 @@ class TaskTracker:
             err = str(exc)
             if "message is not modified" in err:
                 return
-            if "Too Many Requests" in err or "retry after" in err.lower():
-                m = re.search(r"retry after (\d+)", err, re.IGNORECASE)
-                retry_after = int(m.group(1)) if m else 3
-                await telegram_rate_limiter.set_retry_after(msg.chat.id, msg.message_id, retry_after)
-                if not final and not force:
-                    return
-                await asyncio.sleep(retry_after)
+            if "can't parse entities" in err.lower():
                 try:
-                    await asyncio.wait_for(
-                        msg.edit_text(html_text, parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=True),
-                        timeout=timeout,
+                    await telegram_rate_limiter.request(
+                        msg.chat.id,
+                        lambda: edit(
+                            strip_telegram_html(html_text),
+                            markup=reply_markup,
+                        ),
+                        label="task status plain-text fallback",
                     )
                 except Exception:
                     pass
-            elif "can't parse entities" in err.lower():
-                try:
-                    await asyncio.wait_for(
-                        msg.edit_text(strip_telegram_html(html_text), reply_markup=reply_markup),
-                        timeout=timeout,
-                    )
-                except Exception:
-                    pass
+            else:
+                logger.debug("Task status edit failed: %s", exc)
 
     async def _extract_large_code_blocks(self, text: str) -> str:
         """Extract large code blocks to files and schedule Telegram delivery in background."""
@@ -462,13 +497,26 @@ class TaskTracker:
 
     async def _send_snippet_documents(self, snippets: list[tuple[str, str]]) -> None:
         sent_msg_ids = []
+        if self.status_msg is None:
+            for directory in {os.path.dirname(path) for path, _ in snippets}:
+                await asyncio.to_thread(shutil.rmtree, directory, True)
+            return
+        from bot.services.telegram_rate_limiter import telegram_rate_limiter
+
         try:
             for file_path, filename in snippets:
                 try:
-                    msg = await self.bot.send_document(
+                    async def send_document() -> Message:
+                        return await self.bot.send_document(
+                            self.status_msg.chat.id,
+                            FSInputFile(file_path, filename=filename),
+                            message_thread_id=self.thread_id if self.thread_id else None,
+                        )
+
+                    msg = await telegram_rate_limiter.request(
                         self.status_msg.chat.id,
-                        FSInputFile(file_path, filename=filename),
-                        message_thread_id=self.thread_id if self.thread_id else None,
+                        send_document,
+                        label=f"code snippet {filename}",
                     )
                     sent_msg_ids.append(msg.message_id)
                 except Exception as e:
@@ -485,13 +533,24 @@ class TaskTracker:
     async def _send_full_response_document(self, content: str) -> None:
         import tempfile
 
+        if self.status_msg is None:
+            return
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".md", prefix="response_")
         try:
             await asyncio.to_thread(self._write_fd_text_file, tmp_fd, content)
-            msg = await self.bot.send_document(
+            from bot.services.telegram_rate_limiter import telegram_rate_limiter
+
+            async def send_document() -> Message:
+                return await self.bot.send_document(
+                    self.status_msg.chat.id,
+                    FSInputFile(tmp_path, filename="full_response.md"),
+                    message_thread_id=self.thread_id if self.thread_id else None,
+                )
+
+            msg = await telegram_rate_limiter.request(
                 self.status_msg.chat.id,
-                FSInputFile(tmp_path, filename="full_response.md"),
-                message_thread_id=self.thread_id if self.thread_id else None,
+                send_document,
+                label="full task response document",
             )
             rollback_registry.setdefault(self.status_msg.message_id, []).append(msg.message_id)
             if self.thread_id is not None:

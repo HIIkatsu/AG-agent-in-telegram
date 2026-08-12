@@ -72,7 +72,41 @@ def test_collection_never_follows_links_and_does_not_dedupe_names(
 def test_explicit_image_request_is_detected_but_an_analysis_request_is_not() -> None:
     assert artifacts.is_explicit_artifact_request("Загенерируй картинку Фурии")
     assert artifacts.is_explicit_artifact_request("Please generate an image of a cat")
+    assert artifacts.is_explicit_artifact_request(
+        "Сгенерируй мне какую-нибудь простенькую страничку хотя бы сделай."
+    )
+    assert artifacts.is_explicit_artifact_request("Сделай HTML-страницу")
     assert not artifacts.is_explicit_artifact_request("Проанализируй эту картинку")
+
+
+def test_image_request_requires_a_real_image_artifact(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _configure_artifact_root(tmp_path, monkeypatch)
+    output = artifacts.prepare_task_artifact_directory(75)
+    (output / "description.txt").write_text("not an image", encoding="utf-8")
+    collection = asyncio.run(artifacts.collect_task_artifacts(75))
+
+    failure = artifacts.validate_requested_artifacts(
+        "Загенерируй картинку Фурии",
+        collection,
+    )
+
+    assert failure is not None
+    assert "Изображение не было создано" in failure
+    assert artifacts.validate_requested_artifacts(
+        "Сгенерируй мне какую-нибудь простенькую страничку хотя бы сделай.",
+        collection,
+    ) is None
+
+    image = output / "fury.png"
+    image.write_bytes(b"png")
+    with_image = asyncio.run(artifacts.collect_task_artifacts(75))
+    assert artifacts.validate_requested_artifacts(
+        "Загенерируй картинку Фурии",
+        with_image,
+    ) is None
 
 
 def test_image_uses_document_fallback_and_failed_file_is_not_deleted(

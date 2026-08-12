@@ -26,6 +26,7 @@ from bot.services.artifacts import (
     deliver_task_artifacts,
     is_explicit_artifact_request,
     prepare_task_artifact_directory,
+    validate_requested_artifacts,
 )
 from bot.services.execution_profiles import (
     CHAT_MEMORY_CHAR_BUDGET,
@@ -63,6 +64,131 @@ class _MediaGroup:
 _media_groups: dict[tuple[int, str], _MediaGroup] = {}
 
 _VOICE_FRAMES = ["🎙 ⠋ Распознаю...", "🎙 ⠙ Распознаю...", "🎙 ⠹ Распознаю...", "🎙 ⠸ Распознаю..."]
+
+
+async def _safe_message_answer(
+    message: Message,
+    text: str,
+    *,
+    label: str,
+    retries: int = 2,
+    **kwargs,
+) -> Message | None:
+    """Best-effort Telegram reply that can never discard an incoming task.
+
+    A transcription preview is helpful UI, not a prerequisite for putting the
+    recognised user request into the durable queue.  Telegram may return a
+    temporary ``429`` while the bot is already updating a task card.
+    """
+    from bot.services.telegram_rate_limiter import telegram_rate_limiter
+
+    async def answer() -> Message:
+        return await message.answer(text, **kwargs)
+
+    try:
+        return await telegram_rate_limiter.request(
+            message.chat.id,
+            answer,
+            label=label,
+            retries=retries,
+        )
+    except Exception:
+        logger.warning("Telegram reply unavailable (%s)", label, exc_info=True)
+        return None
+
+
+async def _safe_message_reply(
+    message: Message,
+    text: str,
+    *,
+    label: str,
+    retries: int = 2,
+    **kwargs,
+) -> Message | None:
+    """Best-effort reply variant used for non-essential queue notices."""
+    from bot.services.telegram_rate_limiter import telegram_rate_limiter
+
+    async def reply() -> Message:
+        return await message.reply(text, **kwargs)
+
+    try:
+        return await telegram_rate_limiter.request(
+            message.chat.id,
+            reply,
+            label=label,
+            retries=retries,
+        )
+    except Exception:
+        logger.warning("Telegram queue notice unavailable (%s)", label, exc_info=True)
+        return None
+
+
+async def _safe_message_edit(
+    message: Message,
+    text: str,
+    *,
+    label: str,
+    retries: int = 2,
+    **kwargs,
+) -> bool:
+    """Best-effort status edit; errors are logged instead of escaping a handler."""
+    from bot.services.telegram_rate_limiter import telegram_rate_limiter
+
+    async def edit() -> object:
+        return await message.edit_text(text, **kwargs)
+
+    try:
+        await telegram_rate_limiter.request(
+            message.chat.id,
+            edit,
+            label=label,
+            retries=retries,
+        )
+    except Exception:
+        logger.debug("Telegram status edit unavailable (%s)", label, exc_info=True)
+        return False
+    return True
+
+
+async def _safe_message_delete(message: Message, *, label: str) -> bool:
+    """Best-effort status deletion that respects the per-chat cooldown."""
+    from bot.services.telegram_rate_limiter import telegram_rate_limiter
+
+    async def delete() -> object:
+        return await message.delete()
+
+    try:
+        await telegram_rate_limiter.request(
+            message.chat.id,
+            delete,
+            label=label,
+            retries=0,
+        )
+    except Exception:
+        logger.debug("Telegram status deletion unavailable (%s)", label, exc_info=True)
+        return False
+    return True
+
+
+async def _safe_bot_send_message(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    *,
+    label: str,
+    **kwargs,
+) -> Message | None:
+    """Send task UI without coupling task execution to Telegram availability."""
+    from bot.services.telegram_rate_limiter import telegram_rate_limiter
+
+    async def send() -> Message:
+        return await bot.send_message(chat_id, text, **kwargs)
+
+    try:
+        return await telegram_rate_limiter.request(chat_id, send, label=label)
+    except Exception:
+        logger.warning("Telegram task UI unavailable (%s)", label, exc_info=True)
+        return None
 
 def _normalize_filename(name: str) -> str:
     """Normalize uploaded filename to a safe basename with bounded length."""
@@ -172,12 +298,15 @@ async def _animate_voice(msg: Message, stop_event: asyncio.Event) -> None:
     idx = 0
     while not stop_event.is_set():
         idx = (idx + 1) % len(_VOICE_FRAMES)
+        await _safe_message_edit(
+            msg,
+            _VOICE_FRAMES[idx],
+            label="voice transcription animation",
+        )
         try:
-            await msg.edit_text(_VOICE_FRAMES[idx])
-        except Exception:
-            pass
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=0.6)
+            # The chat-wide limiter already protects Telegram, and this avoids
+            # creating needless edit attempts between its permitted updates.
+            await asyncio.wait_for(stop_event.wait(), timeout=1.6)
         except asyncio.TimeoutError:
             pass
 
@@ -259,22 +388,25 @@ async def _process(
     blocking = await task_workspace_manager.get_blocking(thread_id)
     if blocking and thread_id not in _queue_loops:
         pos = await get_queued_count(thread_id)
-        try:
-            msg = await message.reply(
-                f"⏸ Задача поставлена в очередь (позиция {pos}). "
-                f"Сначала примените или отбросьте изменения задачи #{blocking.task_id}.",
-                disable_notification=True,
-            )
+        msg = await _safe_message_reply(
+            message,
+            f"⏸ Задача поставлена в очередь (позиция {pos}). "
+            f"Сначала примените или отбросьте изменения задачи #{blocking.task_id}.",
+            label="blocked task queue notice",
+            disable_notification=True,
+        )
+        if msg is not None:
             t_reg.append(msg.message_id)
-        except Exception:
-            pass
     elif not _start_queue_processing(thread_id, bot, chat_id):
         pos = await get_queued_count(thread_id)
-        try:
-            msg = await message.reply(f"⏳ Задача поставлена в очередь (позиция {pos})", disable_notification=True)
+        msg = await _safe_message_reply(
+            message,
+            f"⏳ Задача поставлена в очередь (позиция {pos})",
+            label="task queue notice",
+            disable_notification=True,
+        )
+        if msg is not None:
             t_reg.append(msg.message_id)
-        except Exception:
-            pass
 
 
 # To store active tracker/agy_task per thread_id for cancellation
@@ -352,21 +484,22 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
             _NAMESPACE_TG = _uuid.UUID('6ba7b810-9ed0-11d1-80b4-00c04fd430c8')
             conversation_id = str(_uuid.uuid5(_NAMESPACE_TG, f"thread-{thread_id}"))
 
-            try:
-                status_msg = await bot.send_message(
-                    chat_id,
-                    f"<b>{'⚡ Chat' if execution_profile == 'chat' else '🛠 Code task'}</b>\n└─ [⠋] Обработка...",
-                    parse_mode="HTML",
-                    message_thread_id=thread_id,
-                )
-            except Exception as exc:
-                logger.exception("Failed to create status message for task #%s", task_id)
-                await finish_task(
+            status_msg = await _safe_bot_send_message(
+                bot,
+                chat_id,
+                f"<b>{'⚡ Chat' if execution_profile == 'chat' else '🛠 Code task'}</b>\n└─ [⠋] Обработка...",
+                label=f"task #{task_id} status card",
+                parse_mode="HTML",
+                message_thread_id=thread_id,
+            )
+            if status_msg is None:
+                # The durable queue and the worker do not depend on an
+                # optional status card.  A temporary Telegram outage used to
+                # discard a claimed task at this point.
+                logger.warning(
+                    "Running task #%s without Telegram status card; UI will recover on later requests",
                     task_id,
-                    TaskStatus.FAILED,
-                    error=f"Could not create Telegram task status message: {exc}",
                 )
-                continue
 
             stop_typing = asyncio.Event()
             typing_task = asyncio.create_task(
@@ -374,7 +507,8 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
             )
             
             t_reg = thread_messages_registry.setdefault(thread_id, [])
-            t_reg.append(status_msg.message_id)
+            if status_msg is not None:
+                t_reg.append(status_msg.message_id)
             
             tracker = TaskTracker(
                 bot, thread_id, status_msg, ws_dir=ws, 
@@ -471,6 +605,8 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 await asyncio.sleep(0.5)
                 continue
             agy_task: asyncio.Task | None = None
+            full_response = ""
+            terminal_error: str | None = None
 
             try:
                 agy_task = asyncio.create_task(run_agy(
@@ -499,35 +635,57 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                     target_status = TaskStatus.FAILED
                 else:
                     target_status = TaskStatus.DONE
-                task_status = (
-                    await finish_task(
-                        task_id,
-                        target_status,
-                        result_summary=full_response[:1000],
-                    )
-                ).status
             except asyncio.CancelledError:
                 full_response = ""
-                task_status = (
-                    await finish_task(
-                        task_id,
-                        TaskStatus.CANCELLED,
-                        error="Cancelled by user",
-                    )
-                ).status
+                target_status = TaskStatus.CANCELLED
+                terminal_error = "Cancelled by user"
             except Exception as exc:
                 full_response = ""
-                task_status = (
-                    await finish_task(
-                        task_id,
-                        TaskStatus.FAILED,
-                        error=str(exc),
-                    )
-                ).status
+                target_status = TaskStatus.FAILED
+                terminal_error = str(exc)
+                logger.exception("Task #%s failed before its final response", task_id)
             finally:
                 stop_typing.set()
                 typing_task.cancel()
                 _active_tasks.pop(thread_id, None)
+
+            # Verify deliverables before announcing a successful task.  The
+            # model's prose and a tool lifecycle event are not proof that an
+            # image/file was created.  This only inspects the exact, private
+            # directory allocated to this task; it never scans a shared CLI
+            # scratch folder.
+            artifact_cleanup_safe = True
+            try:
+                task_artifacts = await collect_task_artifacts(task_id)
+            except ArtifactError as exc:
+                artifact_cleanup_safe = False
+                task_artifacts = None
+                logger.exception("Failed to collect task artifacts for task #%s", task_id)
+                if target_status == TaskStatus.DONE and is_explicit_artifact_request(prompt):
+                    target_status = TaskStatus.FAILED
+                    terminal_error = str(exc)
+                    full_response = (
+                        "❌ Не удалось безопасно проверить итоговый файл, поэтому "
+                        "результат не считается созданным."
+                    )
+                    await tracker.replace_text(full_response)
+
+            if target_status == TaskStatus.DONE:
+                artifact_failure = validate_requested_artifacts(prompt, task_artifacts)
+                if artifact_failure:
+                    target_status = TaskStatus.FAILED
+                    terminal_error = "Requested Telegram deliverable was not produced"
+                    full_response = artifact_failure
+                    await tracker.replace_text(full_response)
+
+            task_status = (
+                await finish_task(
+                    task_id,
+                    target_status,
+                    error=terminal_error,
+                    result_summary=full_response[:1000],
+                )
+            ).status
 
             if execution_profile == "code":
                 try:
@@ -544,17 +702,6 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
 
             await tracker.finish(_tracker_finish_status(task_status))
 
-            artifact_cleanup_safe = True
-            try:
-                task_artifacts = await collect_task_artifacts(task_id)
-            except ArtifactError:
-                # Do not attempt cleanup after a failed safety inspection: the
-                # directory is intentionally retained for an operator to
-                # inspect rather than following a surprising path.
-                artifact_cleanup_safe = False
-                task_artifacts = None
-                logger.exception("Failed to collect task artifacts for task #%s", task_id)
-
             if (
                 task_artifacts is not None
                 and TaskStatus.parse(task_status) == TaskStatus.DONE
@@ -562,7 +709,11 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
             ):
                 from bot.services.tracker import rollback_registry
 
-                rlist = rollback_registry.setdefault(status_msg.message_id, [])
+                rlist = (
+                    rollback_registry.setdefault(status_msg.message_id, [])
+                    if status_msg is not None
+                    else None
+                )
                 report = await deliver_task_artifacts(
                     bot,
                     chat_id,
@@ -579,19 +730,16 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                         report.failed,
                         len(task_artifacts.skipped),
                     )
-                    try:
-                        notice = await bot.send_message(
-                            chat_id,
-                            "⚠️ Не все созданные файлы удалось отправить. "
-                            "Они сохранены на сервере для безопасной проверки.",
-                            message_thread_id=thread_id,
-                        )
+                    notice = await _safe_bot_send_message(
+                        bot,
+                        chat_id,
+                        "⚠️ Не все созданные файлы удалось отправить. "
+                        "Они сохранены на сервере для безопасной проверки.",
+                        label=f"task #{task_id} incomplete artifact notice",
+                        message_thread_id=thread_id,
+                    )
+                    if rlist is not None and notice is not None:
                         rlist.append(notice.message_id)
-                    except Exception:
-                        logger.exception(
-                            "Failed to report incomplete artifact delivery for task #%s",
-                            task_id,
-                        )
 
             if artifact_cleanup_safe:
                 try:
@@ -706,9 +854,18 @@ async def on_voice(message: Message, bot: Bot) -> None:
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(_typing_loop(bot, message.chat.id, stop_typing, thread_id))
 
-    status_msg = await message.answer(_VOICE_FRAMES[0])
+    status_msg = await _safe_message_answer(
+        message,
+        _VOICE_FRAMES[0],
+        label="voice transcription status",
+        retries=0,
+    )
     stop_anim = asyncio.Event()
-    anim_task = asyncio.create_task(_animate_voice(status_msg, stop_anim))
+    anim_task = (
+        asyncio.create_task(_animate_voice(status_msg, stop_anim))
+        if status_msg is not None
+        else None
+    )
 
     try:
         file = await bot.get_file(message.voice.file_id)
@@ -718,30 +875,57 @@ async def on_voice(message: Message, bot: Bot) -> None:
 
         text = await transcribe_voice(tmp)
         stop_anim.set()
-        anim_task.cancel()
+        if anim_task is not None:
+            anim_task.cancel()
 
         if not text or not text.strip():
-            await status_msg.edit_text("Не удалось распознать речь.")
+            if status_msg is not None:
+                await _safe_message_edit(
+                    status_msg,
+                    "Не удалось распознать речь.",
+                    label="empty voice transcription",
+                )
+            else:
+                await _safe_message_answer(
+                    message,
+                    "Не удалось распознать речь.",
+                    label="empty voice transcription fallback",
+                )
             return
 
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
+        if status_msg is not None:
+            await _safe_message_delete(status_msg, label="voice transcription status cleanup")
         preview = text[:500] + "..." if len(text) > 500 else text
-        await message.answer(
+        # This preview is optional.  It must never block the durable enqueue
+        # below when Telegram is temporarily rate-limiting the group.
+        await _safe_message_answer(
+            message,
             f"<b>Распознано:</b>\n\n<blockquote>{preview}</blockquote>",
+            label="voice transcription preview",
+            retries=0,
             parse_mode="HTML",
         )
 
         await _process(message, text, bot)
-    except Exception as e:
+    except Exception:
+        logger.exception("Voice message processing failed")
         stop_anim.set()
-        anim_task.cancel()
-        try:
-            await status_msg.edit_text(f"Ошибка голосового сообщения: {e}")
-        except Exception:
-            await message.answer(f"Ошибка голосового сообщения: {e}")
+        if anim_task is not None:
+            anim_task.cancel()
+        error_text = "Ошибка голосового сообщения. Попробуйте отправить его ещё раз."
+        if status_msg is not None:
+            edited = await _safe_message_edit(
+                status_msg,
+                error_text,
+                label="voice transcription error",
+            )
+            if edited:
+                return
+        await _safe_message_answer(
+            message,
+            error_text,
+            label="voice transcription error fallback",
+        )
     finally:
         stop_typing.set()
         typing_task.cancel()
