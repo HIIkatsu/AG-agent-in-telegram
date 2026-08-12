@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT / "antigravity-bot"))
 os.environ.setdefault("BOT_TOKEN", "123456:test-token")
 os.environ.setdefault("ALLOWED_USER_IDS", "1")
 
-from bot.services.mistral_images import (
+from bot.services.mistral_images import (  # noqa: E402
     MistralImageClient,
     MistralImageError,
     _find_image_urls,
@@ -47,6 +47,25 @@ def test_extracts_a_mistral_image_url_from_tool_completion_payload() -> None:
     ]
 
 
+def test_extracts_image_url_from_choice_messages_shape() -> None:
+    payload = {
+        "choices": [
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "[Image: https://files.mistral.ai/generated/abc123.png]",
+                    }
+                ]
+            }
+        ]
+    }
+
+    assert _find_image_urls(payload) == [
+        "https://files.mistral.ai/generated/abc123.png"
+    ]
+
+
 def test_generated_image_is_written_only_to_the_task_artifact_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -76,6 +95,43 @@ def test_generated_image_is_written_only_to_the_task_artifact_directory(
 
     assert [image.filename for image in images] == ["mistral-image-1.png"]
     assert (artifacts / "mistral-image-1.png").read_bytes() == _PNG
+
+
+def test_mistral_request_forces_the_image_tool(monkeypatch) -> None:
+    client = MistralImageClient(
+        api_key="private-key",
+        api_url="https://api.mistral.ai/v1/chat/completions",
+        model="mistral-small-latest",
+        allowed_download_hosts={"files.mistral.ai"},
+        timeout_seconds=30,
+        max_file_bytes=1024,
+    )
+
+    class _Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def text(self) -> str:
+            return '{"image_url":"https://files.mistral.ai/generated/one.png"}'
+
+    class _Session:
+        def __init__(self) -> None:
+            self.payload = None
+
+        def post(self, _url, *, headers, json):
+            self.payload = json
+            return _Response()
+
+    session = _Session()
+    asyncio.run(client._post_completion(session, "кот"))
+
+    assert session.payload["tools"] == [{"type": "image_generation"}]
+    assert session.payload["tool_choice"] == "any"
 
 
 def test_rejects_download_url_outside_mistral_allow_list() -> None:

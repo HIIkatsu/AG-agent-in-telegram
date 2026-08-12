@@ -14,7 +14,7 @@ from datetime import datetime
 from aiogram import Bot
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from bot.utils.telegram_renderer import chunk_text, part_label, render_markdown, strip_telegram_html
+from bot.utils.telegram_renderer import chunk_text, part_label, render_markdown, render_markdown_chunks, strip_telegram_html
 
 logger = logging.getLogger(__name__)
 
@@ -258,14 +258,14 @@ class TaskTracker:
             
             if not steps_copy and clean_text:
                 # No tools used (simple answer). Transform the status message directly into the final answer.
-                chunks = chunk_text(clean_text, max_len=4000)
+                chunks = render_markdown_chunks(buffer_copy.strip(), max_len=3600)
                 try:
-                    await self._safe_edit(self.status_msg, chunks[0], reply_markup=kb, final=True)
+                    await self._safe_edit(self.status_msg, chunks[0].html, reply_markup=kb, final=True)
                     # If there are more chunks, send them as replies
                     if len(chunks) > 1:
                         reply_id = self.status_msg.reply_to_message.message_id if self.status_msg.reply_to_message else None
                         for i, chunk in enumerate(chunks[1:]):
-                            part_text = f"{part_label(i + 2, len(chunks))}{chunk}"
+                            part_text = f"{part_label(i + 2, len(chunks))}{chunk.html}"
                             msg = await self._send_message(
                                 part_text,
                                 parse_mode="HTML",
@@ -292,11 +292,11 @@ class TaskTracker:
             
             if clean_text:
                 try:
-                    chunks = chunk_text(clean_text, max_len=4000)
+                    chunks = render_markdown_chunks(buffer_copy.strip(), max_len=3600)
                     if len(clean_text) > 12000:
                         reply_id = self.status_msg.reply_to_message.message_id if self.status_msg.reply_to_message else None
                         msg1 = await self._send_message(
-                            chunks[0] + "\n\n<i>[Ответ слишком длинный, см. файл ниже]</i>",
+                            chunks[0].html + "\n\n<i>[Ответ слишком длинный, см. файл ниже]</i>",
                             parse_mode="HTML",
                             message_thread_id=self.thread_id if self.thread_id else None,
                             reply_to_message_id=reply_id,
@@ -309,7 +309,7 @@ class TaskTracker:
                     else:
                         reply_id = self.status_msg.reply_to_message.message_id if self.status_msg.reply_to_message else None
                         for i, chunk in enumerate(chunks):
-                            text_to_send = f"{part_label(i + 1, len(chunks))}{chunk}"
+                            text_to_send = f"{part_label(i + 1, len(chunks))}{chunk.html}"
                             msg = await self._send_message(
                                 text_to_send,
                                 parse_mode="HTML",

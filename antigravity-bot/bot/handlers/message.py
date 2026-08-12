@@ -46,6 +46,18 @@ logger = logging.getLogger(__name__)
 _queue_loops: set[int] = set()
 
 _MEDIA_GROUP_DEBOUNCE_SECONDS = 0.8
+_TEXT_DEBOUNCE_SECONDS = 0.9
+_TEXT_JOIN_SEPARATOR = "\n"
+
+
+@dataclass
+class _PendingText:
+    """Consecutive Telegram text fragments that belong to one user request."""
+
+    message: Message
+    bot: Bot
+    parts: list[str] = field(default_factory=list)
+    timer: asyncio.Task[None] | None = None
 
 
 @dataclass
@@ -62,6 +74,7 @@ class _MediaGroup:
 # Include the chat in the key because Telegram only guarantees a media group ID
 # within the context in which the album was sent.
 _media_groups: dict[tuple[int, str], _MediaGroup] = {}
+_text_groups: dict[tuple[int, int | None, int], _PendingText] = {}
 
 _VOICE_FRAMES = ["🎙 ⠋ Распознаю...", "🎙 ⠙ Распознаю...", "🎙 ⠹ Распознаю...", "🎙 ⠸ Распознаю..."]
 
@@ -199,6 +212,42 @@ def _normalize_filename(name: str) -> str:
         return "uploaded_file"
     stem, ext = os.path.splitext(name)
     return f"{stem[:80]}{ext[:16]}"
+
+
+async def _flush_text_group(key: tuple[int, int | None, int]) -> None:
+    """Wait for consecutive Telegram text chunks, then enqueue one task."""
+    try:
+        await asyncio.sleep(_TEXT_DEBOUNCE_SECONDS)
+        group = _text_groups.pop(key, None)
+        if group is None:
+            return
+        text = _TEXT_JOIN_SEPARATOR.join(part for part in group.parts if part)
+        if text.strip():
+            await _process(group.message, text, group.bot)
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        logger.exception("Failed to flush Telegram text group for chat/thread/user %s", key)
+
+
+def _buffer_text_message(message: Message, bot: Bot, text: str) -> None:
+    """Debounce adjacent text messages from one user into a single model task.
+
+    Telegram clients split pasted text that exceeds the message limit. Without
+    this quiet-period buffer each fragment becomes an independent queued task,
+    so the agent sees incomplete instructions. Commands are excluded by the
+    router and every user/thread has an independent buffer.
+    """
+    assert message.from_user
+    key = (message.chat.id, message.message_thread_id, message.from_user.id)
+    group = _text_groups.get(key)
+    if group is None:
+        group = _PendingText(message=message, bot=bot)
+        _text_groups[key] = group
+    elif group.timer is not None:
+        group.timer.cancel()
+    group.parts.append(text)
+    group.timer = asyncio.create_task(_flush_text_group(key))
 
 
 async def _flush_media_group(key: tuple[int, str]) -> None:
@@ -482,7 +531,16 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
             # Deterministic valid UUIDv5 based on thread_id
             import uuid as _uuid
             _NAMESPACE_TG = _uuid.UUID('6ba7b810-9ed0-11d1-80b4-00c04fd430c8')
-            conversation_id = str(_uuid.uuid5(_NAMESPACE_TG, f"thread-{thread_id}"))
+            conversation_id = str(
+                _uuid.uuid5(
+                    _NAMESPACE_TG,
+                    (
+                        f"thread-{thread_id}"
+                        if execution_profile == "chat"
+                        else f"thread-{thread_id}-task-{task_id}"
+                    ),
+                )
+            )
 
             status_msg = await _safe_bot_send_message(
                 bot,
@@ -791,7 +849,7 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
 @router.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message, bot: Bot) -> None:
     assert message.text
-    await _process(message, message.text, bot)
+    _buffer_text_message(message, bot, message.text)
 
 
 # -- Photo --

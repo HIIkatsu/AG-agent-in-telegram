@@ -44,7 +44,7 @@ def render_markdown(text: str) -> RenderedText:
 
 
 def chunk_text(text: str, max_len: int = MAX_TELEGRAM_TEXT) -> list[str]:
-    """Split text into Telegram-sized chunks without losing long lines."""
+    """Split plain text into Telegram-sized chunks without losing long lines."""
     if len(text) <= max_len:
         return [text]
     chunks: list[str] = []
@@ -64,6 +64,64 @@ def chunk_text(text: str, max_len: int = MAX_TELEGRAM_TEXT) -> list[str]:
         chunks.append(current)
     return chunks or [text[:max_len]]
 
+
+def render_markdown_chunks(text: str, max_len: int = MAX_TELEGRAM_TEXT) -> list[RenderedText]:
+    """Render Markdown in Telegram-sized chunks without splitting HTML entities/tags.
+
+    Telegram validates every message independently. Splitting already rendered
+    HTML can cut a ``<pre><code>`` block, an entity such as ``&lt;`` or a tag in
+    half, which makes code blocks display incorrectly or fall back to plain
+    text.  Chunk the Markdown/plain source first and render each chunk as a
+    complete HTML document fragment instead.
+    """
+    if not text:
+        return [RenderedText("", "")]
+    return [render_markdown(chunk) for chunk in _chunk_markdown_source(text, max_len=max_len)]
+
+
+def _chunk_markdown_source(text: str, max_len: int) -> list[str]:
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    fence_lang: str | None = None
+
+    def current_suffix() -> str:
+        return "\n```" if fence_lang is not None else ""
+
+    def reset_prefix() -> list[str]:
+        return [f"```{fence_lang}"] if fence_lang is not None else []
+
+    def flush() -> None:
+        nonlocal current, current_len
+        if not current:
+            return
+        chunks.append("\n".join(current) + current_suffix())
+        current = reset_prefix()
+        current_len = len(current[0]) if current else 0
+
+    for line in text.split("\n"):
+        projected = current_len + len(line) + (1 if current else 0) + len(current_suffix())
+        if projected > max_len and current:
+            flush()
+
+        while len(line) > max_len:
+            part, line = line[:max_len], line[max_len:]
+            if current:
+                flush()
+            chunks.append(part)
+
+        current.append(line)
+        current_len += len(line) + (1 if current_len else 0)
+
+        if line.startswith("```"):
+            fence_lang = None if fence_lang is not None else line[3:].strip()
+
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
 
 def part_label(index: int, total: int) -> str:
     return f"<i>(Часть {index}/{total})</i>\n\n" if total > 1 else ""

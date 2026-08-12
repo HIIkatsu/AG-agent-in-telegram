@@ -25,3 +25,15 @@ def test_plain_fallback_removes_telegram_tags():
 def test_part_label_is_only_needed_for_multi_part_messages():
     assert part_label(1, 1) == ''
     assert 'Часть 2/3' in part_label(2, 3)
+
+
+def test_render_markdown_chunks_do_not_split_code_html_tags():
+    from bot.utils.telegram_renderer import render_markdown_chunks
+
+    source = "```python\n" + "print('&<>')\n" * 120 + "```"
+    chunks = render_markdown_chunks(source, max_len=500)
+
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert chunk.html.count("<pre><code") == chunk.html.count("</code></pre>")
+        assert "&lt;" in chunk.html or "print" in chunk.html

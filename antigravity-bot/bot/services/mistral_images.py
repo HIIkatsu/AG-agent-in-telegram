@@ -166,6 +166,7 @@ class MistralImageClient:
                 }
             ],
             "tools": [{"type": "image_generation"}],
+            "tool_choice": "any",
         }
         async with session.post(self._api_url, headers=self._headers(), json=payload) as response:
             raw = await response.text()
