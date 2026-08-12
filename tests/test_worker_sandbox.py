@@ -236,6 +236,41 @@ def test_production_worker_identity_cannot_be_root(monkeypatch: pytest.MonkeyPat
         worker_sandbox._worker_ids()
 
 
+def test_worker_home_rejects_root_owned_internal_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_worker(tmp_path, monkeypatch)
+    home = Path(settings.agy_worker_home)
+    broken_directory = home / ".gemini" / "antigravity-cli"
+    real_lstat = Path.lstat
+
+    def lstat_with_root_owned_cli(path: Path) -> os.stat_result:
+        metadata = real_lstat(path)
+        if path == broken_directory:
+            values = list(metadata)
+            values[4] = metadata.st_uid + 1
+            return os.stat_result(values)
+        return metadata
+
+    monkeypatch.setattr(Path, "lstat", lstat_with_root_owned_cli)
+
+    with pytest.raises(worker_sandbox.WorkerSandboxError, match="must be owned"):
+        worker_sandbox._worker_home()
+
+
+def test_worker_home_rejects_non_writable_internal_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_worker(tmp_path, monkeypatch)
+    home = Path(settings.agy_worker_home)
+    (home / ".gemini" / "antigravity-cli").chmod(0o550)
+
+    with pytest.raises(worker_sandbox.WorkerSandboxError, match="must grant"):
+        worker_sandbox._worker_home()
+
+
 def test_bubblewrap_probe_includes_the_dynamic_loader_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

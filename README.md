@@ -69,8 +69,15 @@ useradd --system --create-home \
   --shell /usr/sbin/nologin agyworker
 
 install -d -o agyworker -g agyworker -m 0750 \
+  /opt/antigravity-bot/agy-worker-home \
+  /opt/antigravity-bot/agy-worker-home/.gemini \
   /opt/antigravity-bot/agy-worker-home/.gemini/config \
-  /opt/antigravity-bot/agy-worker-home/.gemini/antigravity-cli/skills
+  /opt/antigravity-bot/agy-worker-home/.gemini/antigravity-cli \
+  /opt/antigravity-bot/agy-worker-home/.gemini/antigravity-cli/skills \
+  /opt/antigravity-bot/agy-worker-home/.config \
+  /opt/antigravity-bot/agy-worker-home/.cache \
+  /opt/antigravity-bot/agy-worker-home/.local \
+  /opt/antigravity-bot/agy-worker-home/.local/share
 printf '{}\n' > /opt/antigravity-bot/agy-worker-home/.gemini/config/mcp_config.json
 chown agyworker:agyworker \
   /opt/antigravity-bot/agy-worker-home/.gemini/config/mcp_config.json
