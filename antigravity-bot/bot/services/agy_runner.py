@@ -9,6 +9,7 @@ import os
 import signal
 import tempfile
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 from aiogram import Bot
 
@@ -78,6 +79,13 @@ _BASE_RUNTIME_RULES = """\
 - Если пользователь задаёт вопрос — отвечай текстом, НЕ создавая файлы.
 - Создавай файлы ТОЛЬКО когда пользователь явно просит создать/написать/сделать файл.
 - Все файлы создавай и редактируй в своей текущей рабочей директории.
+
+## Telegram artifacts
+- Если пользователь явно запросил итоговый файл, документ или изображение для
+  отправки в Telegram, сохрани только готовый пользовательский результат в
+  $AGY_ARTIFACT_DIR. Этот каталог будет автоматически отправлен после задачи.
+- Не помещай туда исходники проекта, .env, конфигурации, логи, секреты или
+  промежуточные файлы. Для обычного ответа не создавай в нём ничего.
 
 ## Formatting
 - Форматируй ответы для удобного чтения в Telegram.
@@ -177,6 +185,7 @@ async def run_agy(
     mode: str = "code",
     execution_profile: str = "code",
     thread_id: int | None = None,
+    artifact_dir: str | Path | None = None,
 ) -> str:
     """Execute agy CLI process with 5-minute timeout, STDIN permissions, backups, error capture, and Russian language enforcement."""
     is_chat = execution_profile == "chat"
@@ -186,6 +195,9 @@ async def run_agy(
     else:
         execution_dir = workspace_dir
         os.makedirs(execution_dir, exist_ok=True)
+
+    if artifact_dir is None:
+        raise WorkerSandboxError("Task artifact directory is required for every AGY task")
 
     memory = await load_global_memory_snapshot()
     full_prompt, instructions_sha256 = _build_runtime_prompt(
@@ -243,6 +255,7 @@ async def run_agy(
         launch = build_sandbox_launch(
             agy_args=cmd,
             execution_dir=execution_dir,
+            artifact_dir=artifact_dir,
             capability_dir=endpoint.mount_dir,
             capability_token=endpoint.token,
             thread_id=thread_id,
@@ -263,6 +276,7 @@ async def run_agy(
         launch = build_unsandboxed_development_launch(
             agy_args=cmd,
             execution_dir=execution_dir,
+            artifact_dir=artifact_dir,
             thread_id=thread_id,
         )
 
@@ -275,6 +289,7 @@ async def run_agy(
             cwd=launch.cwd,
             env=launch.env,
             start_new_session=True,
+            preexec_fn=getattr(launch, "preexec_fn", None),
         )
     except Exception:
         if broker is not None:
@@ -423,7 +438,12 @@ async def run_agy(
             await stderr_task
 
             if proc.returncode and proc.returncode != 0:
-                logger.warning("agy process exited with code %d", proc.returncode)
+                detail = stderr_response.strip()
+                logger.warning(
+                    "agy process exited with code %d: %s",
+                    proc.returncode,
+                    detail[:2000] if detail else "no stderr output",
+                )
                 if stderr_response.strip() and "Ошибка" not in full_response:
                     err_msg = f"\n\n❌ **Ошибка выполнения:**\n```\n{stderr_response.strip()[:1000]}\n```"
                     full_response += err_msg

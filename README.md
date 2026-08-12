@@ -9,7 +9,7 @@ Telegram bot integration for **Antigravity CLI** agent execution, featuring mult
 - 🎤 **Voice Support**: Instant voice message transcription via cloud STT (Groq with Wit.ai fallback).
 - 🔄 **Task-scoped Git Safety**: Every code task runs in a private repository snapshot. Accept applies only that task's checked patch; Discard removes only its isolated workspace and never resets the mounted project.
 - 🛡️ **Runtime Rules**: Combines tracked `INSTRUCTIONS.md` policy with optional private `INSTRUCTIONS.local.md` context without modifying mounted projects.
-- 🧩 **Global Agent Skills**: Registers every bundled skill in AGY's user-level skill directory while leaving each mounted project's `.agents` directory untouched.
+- 🧩 **Global Agent Skills**: Registers every bundled skill in AGY's native worker-home skill directory while leaving each mounted project's `.agents` directory untouched.
 - 🧠 **Two-layer Memory**: Keeps global user facts and per-project notes separate; AGY uses native MCP tools to manage both without shell access to SQLite.
 - 🔒 **Sandboxed Worker & Capability Broker**: Runs every AGY task in a separate Bubblewrap namespace with no bot `.env`, SQLite database or SSH key. Memory and remote access are exposed only through narrow, task-scoped capabilities.
 
@@ -35,10 +35,16 @@ Telegram bot integration for **Antigravity CLI** agent execution, featuring mult
 
 1. Copy `.env.example` to `.env` and fill in your Telegram Bot credentials.
 2. Optionally copy `antigravity-bot/INSTRUCTIONS.local.example.md` to `antigravity-bot/INSTRUCTIONS.local.md` and add private personal or infrastructure context. The local file is ignored by Git; never put secrets in it. Restart the bot after changing it so a new instruction snapshot and SHA-256 are loaded.
-3. Keep `AGY_GLOBAL_SKILLS_DIR` at AGY CLI's user-level default unless the service runs under a custom home directory. On startup the bot creates only manifest-managed skill copies there and refuses to overwrite user-owned or locally modified skills with the same names.
+3. The bot registers bundled skills in `AGY_WORKER_HOME/.gemini/antigravity-cli/skills`. Keep that path a real directory, not a symbolic link. On startup the bot creates only manifest-managed skill copies there and refuses to overwrite user-owned or locally modified skills with the same names.
 4. In normal production mode, the bot generates a per-task memory MCP configuration inside the worker sandbox. It does not read or modify the service account's `AGY_MCP_CONFIG_PATH`. That path is retained only for the explicit local `AGY_ALLOW_UNSANDBOXED_DEV=true` fallback.
 5. Keep `TASK_WORKSPACES_DIR` outside mounted repositories. Tracked and non-ignored files are copied there for each code task; ignored secrets such as `.env` are excluded.
 6. Install dependencies: `pip install -r antigravity-bot/requirements.txt`.
+
+When a user explicitly requests a finished file or image, AGY writes it to a
+private per-task output directory and the bot sends it to Telegram
+automatically. Normal chat replies and changed project files are not uploaded
+implicitly. `TASK_ARTIFACTS_DIR` stays outside project workspaces; it defaults
+to `/tmp/antigravity-task-artifacts`.
 
 If you intentionally use the local unsandboxed development fallback and its MCP
 config is invalid, the bot remains available but that fallback's native memory
@@ -97,12 +103,14 @@ below `/usr` is also accepted. Configure the AGY account/login separately with
 CLI's own authentication and session data, never bot secrets.
 
 The bot keeps its bundled skills as skills: it syncs them to
-`AGY_GLOBAL_SKILLS_DIR` and mounts that directory read-only into every worker.
-The worker receives a generated, per-task MCP configuration, so native
-`save_memory`, `list_memory`, and `delete_memory` still work without exposing a
-database path. The `remote-environments` skill uses `ag-ssh`; its only possible
-operations are listing configured names, showing the public key, and submitting
-one remote command for an explicit Telegram approval.
+`AGY_WORKER_HOME/.gemini/antigravity-cli/skills`. The directory must be a real
+worker-owned directory, never a symlink; no state from `/root/.gemini` is
+mounted into an AGY task. The worker receives a generated, per-task MCP
+configuration, so native `save_memory`, `list_memory`, and `delete_memory`
+still work without exposing a database path. The `remote-environments` skill
+uses `ag-ssh`; its only possible operations are listing configured names,
+showing the public key, and submitting one remote command for an explicit
+Telegram approval.
 
 The short-lived capability socket is reachable only through that task's mounted
 directory and every request carries a fresh 256-bit token. This is deliberate:

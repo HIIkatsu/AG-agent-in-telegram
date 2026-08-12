@@ -23,7 +23,10 @@ def _worker_identity() -> tuple[int, int]:
     return os.geteuid(), os.getegid()
 
 
-def _configure_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+def _configure_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path, Path]:
     uid, gid = _worker_identity()
     home = tmp_path / "worker-home"
     (home / ".gemini/config").mkdir(parents=True)
@@ -37,10 +40,10 @@ def _configure_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[
         if path.stat().st_uid != uid or path.stat().st_gid != gid:
             os.chown(path, uid, gid)
 
-    skills = tmp_path / "skills"
-    skills.mkdir()
     task_root = tmp_path / "task-workspaces"
     task_root.mkdir()
+    artifacts_root = tmp_path / "task-artifacts"
+    artifacts_root.mkdir()
     capability_root = tmp_path / "capability"
     capability_root.mkdir()
 
@@ -55,9 +58,15 @@ def _configure_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[
     # chown to 65534. Exercise the launch builder with its current identity;
     # production still reaches the real non-root validation in _worker_ids.
     monkeypatch.setattr(worker_sandbox, "_worker_ids", lambda: (uid, gid))
-    monkeypatch.setattr(settings, "agy_global_skills_dir", str(skills))
     monkeypatch.setattr(settings, "task_workspaces_dir", str(task_root))
-    return task_root, capability_root
+    monkeypatch.setattr(settings, "task_artifacts_dir", str(artifacts_root))
+    return task_root, capability_root, artifacts_root
+
+
+def _artifact_dir(root: Path, name: str) -> Path:
+    target = root / name
+    target.mkdir()
+    return target
 
 
 def _ro_bind_index(command: list[str], source: str, destination: str) -> int:
@@ -71,9 +80,10 @@ def test_sandbox_launch_strips_bot_environment_and_exposes_only_capabilities(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    task_root, capability_root = _configure_worker(tmp_path, monkeypatch)
+    task_root, capability_root, artifacts_root = _configure_worker(tmp_path, monkeypatch)
     workspace = task_root / "task-42"
     workspace.mkdir()
+    artifact_dir = _artifact_dir(artifacts_root, "task-42")
     (workspace / "project.txt").write_text("safe task copy", encoding="utf-8")
     monkeypatch.setenv("BOT_TOKEN", "do-not-leak-this-token")
     monkeypatch.setenv("AGY_BOT_DB_PATH", "/private/bot.db")
@@ -81,6 +91,7 @@ def test_sandbox_launch_strips_bot_environment_and_exposes_only_capabilities(
     launch = worker_sandbox.build_sandbox_launch(
         agy_args=["/usr/bin/true", "--print", "inspect"],
         execution_dir=str(workspace),
+        artifact_dir=artifact_dir,
         capability_dir=capability_root,
         capability_token="per-task-secret",
         thread_id=42,
@@ -91,11 +102,16 @@ def test_sandbox_launch_strips_bot_environment_and_exposes_only_capabilities(
     assert "--disable-userns" in command
     assert "--unshare-pid" in command
     assert "--clearenv" in command
+    assert command[command.index("--uid") + 1] == "0"
+    assert command[command.index("--gid") + 1] == "0"
     assert "--bind" in command
     assert str(workspace) in command
     assert "/workspace" in command
     assert str(capability_root) in command
     assert "/run/ag-capabilities" in command
+    assert str(artifact_dir) in command
+    assert "/run/ag-artifacts" in command
+    assert "/home/agy/.gemini/antigravity-cli/scratch" in command
     assert command[command.index("--symlink") + 1 : command.index("--symlink") + 3] == [
         "/opt/ag-worker-tools/capability_client.py",
         "/opt/ag-worker-tools/ag-ssh",
@@ -104,6 +120,8 @@ def test_sandbox_launch_strips_bot_environment_and_exposes_only_capabilities(
     assert command[path_index + 1].startswith("/opt/ag-worker-tools:")
     assert "AGY_CAPABILITY_TOKEN" in command
     assert "per-task-secret" in command
+    assert command[command.index("AGY_ARTIFACT_DIR") + 1] == "/run/ag-artifacts"
+    assert command[command.index("TMPDIR") + 1] == "/run/ag-artifacts"
     assert "AGY_BOT_ROOT" not in command
     assert "AGY_BOT_DB_PATH" not in command
     assert str(ROOT / "antigravity-bot") not in command
@@ -116,6 +134,7 @@ def test_sandbox_launch_strips_bot_environment_and_exposes_only_capabilities(
     assert "AGY_BOT_DB_PATH" not in launch.env
     assert "do-not-leak-this-token" not in launch.env.values()
     assert "per-task-secret" not in launch.env.values()
+    assert launch.preexec_fn is None
 
     command_start = command.index("--") + 1
     assert str(workspace) not in command[command_start:]
@@ -140,14 +159,16 @@ def test_sandbox_refuses_an_unmanaged_execution_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _task_root, capability_root = _configure_worker(tmp_path, monkeypatch)
+    _task_root, capability_root, artifacts_root = _configure_worker(tmp_path, monkeypatch)
     unmanaged = tmp_path / "not-managed-by-bot"
     unmanaged.mkdir()
+    artifact_dir = _artifact_dir(artifacts_root, "task-43")
 
     with pytest.raises(worker_sandbox.WorkerSandboxError, match="outside"):
         worker_sandbox.build_sandbox_launch(
             agy_args=["/usr/bin/true", "--print", "inspect"],
             execution_dir=str(unmanaged),
+            artifact_dir=artifact_dir,
             capability_dir=capability_root,
             capability_token="token",
             thread_id=None,
@@ -158,7 +179,7 @@ def test_sandbox_rejects_cli_outside_dedicated_runtime_or_usr(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _task_root, _capability_root = _configure_worker(tmp_path, monkeypatch)
+    _task_root, _capability_root, _artifacts_root = _configure_worker(tmp_path, monkeypatch)
     outside = tmp_path / "root-like-home" / "agy"
     outside.parent.mkdir()
     outside.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -176,7 +197,7 @@ def test_sandbox_mounts_a_dedicated_cli_runtime_read_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    task_root, capability_root = _configure_worker(tmp_path, monkeypatch)
+    task_root, capability_root, artifacts_root = _configure_worker(tmp_path, monkeypatch)
     runtime = tmp_path / "runtime"
     executable = runtime / "bin" / "agy"
     executable.parent.mkdir(parents=True)
@@ -184,12 +205,14 @@ def test_sandbox_mounts_a_dedicated_cli_runtime_read_only(
     executable.chmod(0o755)
     workspace = task_root / "task-13"
     workspace.mkdir()
+    artifact_dir = _artifact_dir(artifacts_root, "task-13")
     monkeypatch.setattr(settings, "agy_path", str(executable))
     monkeypatch.setattr(settings, "agy_worker_runtime_dir", str(runtime))
 
     launch = worker_sandbox.build_sandbox_launch(
         agy_args=[str(executable), "--print", "inspect"],
         execution_dir=str(workspace),
+        artifact_dir=artifact_dir,
         capability_dir=capability_root,
         capability_token="token",
         thread_id=13,
@@ -204,13 +227,15 @@ def test_sandbox_rewrites_add_dir_to_its_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    task_root, capability_root = _configure_worker(tmp_path, monkeypatch)
+    task_root, capability_root, artifacts_root = _configure_worker(tmp_path, monkeypatch)
     workspace = task_root / "task-14"
     workspace.mkdir()
+    artifact_dir = _artifact_dir(artifacts_root, "task-14")
 
     launch = worker_sandbox.build_sandbox_launch(
         agy_args=["/usr/bin/true", "--add-dir", str(workspace), "--print", "inspect"],
         execution_dir=str(workspace),
+        artifact_dir=artifact_dir,
         capability_dir=capability_root,
         capability_token="token",
         thread_id=14,
@@ -234,6 +259,18 @@ def test_production_worker_identity_cannot_be_root(monkeypatch: pytest.MonkeyPat
 
     with pytest.raises(worker_sandbox.WorkerSandboxError, match="non-root"):
         worker_sandbox._worker_ids()
+
+
+def test_root_service_launches_bubblewrap_as_the_dedicated_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_sandbox, "_worker_ids", lambda: (999, 988))
+    monkeypatch.setattr(worker_sandbox.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(worker_sandbox.os, "getegid", lambda: 0)
+
+    preexec = worker_sandbox._worker_launch_preexec()
+
+    assert preexec is not None
 
 
 def test_worker_home_rejects_root_owned_internal_directory(

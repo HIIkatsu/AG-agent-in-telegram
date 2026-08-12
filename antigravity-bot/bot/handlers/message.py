@@ -20,9 +20,12 @@ from aiogram.types import Message
 from bot.db import db
 from bot.services.agy_runner import run_agy
 from bot.services.artifacts import (
+    ArtifactError,
+    cleanup_task_artifact_directory,
     collect_task_artifacts,
-    deliver_and_cleanup_artifacts,
-    is_managed_workspace_path,
+    deliver_task_artifacts,
+    is_explicit_artifact_request,
+    prepare_task_artifact_directory,
 )
 from bot.services.execution_profiles import (
     CHAT_MEMORY_CHAR_BUDGET,
@@ -383,8 +386,6 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
             # prepared (before the AGY subprocess exists).
             _active_tasks[thread_id] = (tracker, None)
 
-            import time as _time
-            artifacts_started_at = _time.time()
             agent_ws = ws
             if execution_profile == "code":
                 await tracker.on_tool_start("task_workspace", "Создаю изолированный workspace")
@@ -439,6 +440,36 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                     await tracker.finish(_tracker_finish_status(final_status.status))
                     await asyncio.sleep(0.5)
                     continue
+            try:
+                artifact_dir = await asyncio.to_thread(
+                    prepare_task_artifact_directory,
+                    task_id,
+                )
+            except ArtifactError as exc:
+                logger.exception("Failed to prepare artifact directory for task #%s", task_id)
+                final_status = await finish_task(
+                    task_id,
+                    TaskStatus.FAILED,
+                    error=str(exc),
+                )
+                if execution_profile == "code":
+                    try:
+                        await task_workspace_manager.discard(
+                            task_id,
+                            state="artifact_setup_failed",
+                            allow_active=True,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to clean workspace after artifact setup failure for task #%s",
+                            task_id,
+                        )
+                stop_typing.set()
+                typing_task.cancel()
+                _active_tasks.pop(thread_id, None)
+                await tracker.finish(_tracker_finish_status(final_status.status))
+                await asyncio.sleep(0.5)
+                continue
             agy_task: asyncio.Task | None = None
 
             try:
@@ -455,14 +486,19 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                     mode=mode,
                     execution_profile=execution_profile,
                     thread_id=thread_id,
+                    artifact_dir=artifact_dir,
                 ))
                 _active_tasks[thread_id] = (tracker, agy_task)
                 full_response = await agy_task
-                target_status = (
-                    TaskStatus.TIMEOUT
-                    if "Превышен таймаут" in full_response
-                    else TaskStatus.DONE
-                )
+                if "Превышен таймаут" in full_response:
+                    target_status = TaskStatus.TIMEOUT
+                elif (
+                    "❌ **Ошибка выполнения" in full_response
+                    or "❌ <b>Песочница AGY не готова." in full_response
+                ):
+                    target_status = TaskStatus.FAILED
+                else:
+                    target_status = TaskStatus.DONE
                 task_status = (
                     await finish_task(
                         task_id,
@@ -493,23 +529,7 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 typing_task.cancel()
                 _active_tasks.pop(thread_id, None)
 
-            synced_files: list[str] = []
             if execution_profile == "code":
-                # Keep generated scratch artifacts inside the isolated workspace so
-                # they are part of this task's patch, never copied into the source.
-                new_files = await collect_task_artifacts(agent_ws, artifacts_started_at)
-                import shutil
-
-                for fpath in new_files:
-                    if not is_managed_workspace_path(fpath) and os.path.exists(fpath):
-                        dst = os.path.join(agent_ws, os.path.basename(fpath))
-                        try:
-                            shutil.copy2(fpath, dst)
-                            synced_files.append(dst)
-                        except Exception:
-                            logger.exception("Failed to copy scratch artifact into task workspace")
-                    else:
-                        synced_files.append(fpath)
                 try:
                     tracker.has_changes_after_finish = await task_workspace_manager.has_changes(task_id)
                     if tracker.has_changes_after_finish:
@@ -524,18 +544,68 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
 
             await tracker.finish(_tracker_finish_status(task_status))
 
-            if execution_profile == "chat":
-                await asyncio.sleep(0.5)
-                continue
+            artifact_cleanup_safe = True
+            try:
+                task_artifacts = await collect_task_artifacts(task_id)
+            except ArtifactError:
+                # Do not attempt cleanup after a failed safety inspection: the
+                # directory is intentionally retained for an operator to
+                # inspect rather than following a surprising path.
+                artifact_cleanup_safe = False
+                task_artifacts = None
+                logger.exception("Failed to collect task artifacts for task #%s", task_id)
 
-            if synced_files:
+            if (
+                task_artifacts is not None
+                and TaskStatus.parse(task_status) == TaskStatus.DONE
+                and is_explicit_artifact_request(prompt)
+            ):
                 from bot.services.tracker import rollback_registry
+
                 rlist = rollback_registry.setdefault(status_msg.message_id, [])
-                await deliver_and_cleanup_artifacts(bot, chat_id, synced_files, thread_id=thread_id, rollback_list=rlist)
+                report = await deliver_task_artifacts(
+                    bot,
+                    chat_id,
+                    task_artifacts,
+                    thread_id=thread_id,
+                    rollback_list=rlist,
+                )
+                if report.failed or task_artifacts.skipped:
+                    artifact_cleanup_safe = False
+                    logger.warning(
+                        "Task artifact delivery incomplete for task #%s: delivered=%d failed=%d skipped=%d",
+                        task_id,
+                        report.delivered,
+                        report.failed,
+                        len(task_artifacts.skipped),
+                    )
+                    try:
+                        notice = await bot.send_message(
+                            chat_id,
+                            "⚠️ Не все созданные файлы удалось отправить. "
+                            "Они сохранены на сервере для безопасной проверки.",
+                            message_thread_id=thread_id,
+                        )
+                        rlist.append(notice.message_id)
+                    except Exception:
+                        logger.exception(
+                            "Failed to report incomplete artifact delivery for task #%s",
+                            task_id,
+                        )
+
+            if artifact_cleanup_safe:
+                try:
+                    await asyncio.to_thread(cleanup_task_artifact_directory, task_id)
+                except ArtifactError:
+                    logger.exception("Failed to clean task artifact directory for task #%s", task_id)
 
             if tracker.has_changes_after_finish:
                 # Do not let the next task branch from a stale source snapshot.
                 break
+
+            if execution_profile == "chat":
+                await asyncio.sleep(0.5)
+                continue
 
             try:
                 await task_workspace_manager.discard(

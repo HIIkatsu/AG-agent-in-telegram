@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import stat
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,43 @@ os.environ.setdefault("ALLOWED_USER_IDS", "1")
 
 from bot.config import settings
 from bot.services import capability_broker
+
+
+def test_broker_parent_is_unlistable_but_traversable_by_the_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "sockets"
+    monkeypatch.setattr(settings, "agy_capability_socket_dir", str(root))
+    broker = capability_broker.TaskCapabilityBroker(
+        bot=SimpleNamespace(),
+        chat_id=1,
+        thread_id=None,
+        task_id=None,
+        worker_uid=os.geteuid(),
+        worker_gid=os.getegid(),
+    )
+    fake_server = SimpleNamespace(close=lambda: None, wait_closed=AsyncMock())
+
+    async def fake_start_unix_server(_callback, *, path):
+        Path(path).touch()
+        return fake_server
+
+    monkeypatch.setattr(
+        capability_broker.asyncio,
+        "start_unix_server",
+        fake_start_unix_server,
+    )
+
+    async def exercise() -> None:
+        endpoint = await broker.start()
+        try:
+            assert stat.S_IMODE(root.stat().st_mode) == 0o711
+            assert stat.S_IMODE(endpoint.mount_dir.stat().st_mode) == 0o711
+        finally:
+            await broker.close()
+
+    asyncio.run(exercise())
 
 
 def test_broker_rejects_wrong_token_and_handles_memory_capability(

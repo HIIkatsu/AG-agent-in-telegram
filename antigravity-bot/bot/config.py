@@ -25,7 +25,6 @@ class Settings(BaseSettings):
     allowed_user_ids: str  # comma-separated
     forum_group_id: int = 0  # Telegram chat ID of the forum group
     agy_path: str = "/root/.local/bin/agy"
-    agy_global_skills_dir: str = "~/.gemini/antigravity-cli/skills"
     agy_mcp_config_path: str = "~/.gemini/config/mcp_config.json"
     # AGY always runs in a fail-closed Bubblewrap worker. The dedicated worker
     # home may contain only the CLI's own authentication/runtime state; bot
@@ -43,6 +42,12 @@ class Settings(BaseSettings):
     agy_allow_unsandboxed_dev: bool = False
     workspaces_dir: str = "/tmp/workspaces"
     task_workspaces_dir: str = "/tmp/antigravity-task-workspaces"
+    # Every AGY invocation gets one private output directory. It is mounted at
+    # the CLI scratch path and is the only location from which generated files
+    # are auto-delivered to Telegram.
+    task_artifacts_dir: str = "/tmp/antigravity-task-artifacts"
+    artifact_max_files: int = 20
+    artifact_max_size_mb: int = 45
     db_path: str = "/opt/antigravity-bot/data/bot.db"
     log_level: str = "INFO"
     config_json_path: str = "/opt/antigravity-bot/config.json"

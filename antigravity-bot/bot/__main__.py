@@ -89,15 +89,15 @@ def check_startup() -> None:
         else:
             logger.info("agy found in PATH")
             
-    # Register bundled skills in AGY's user-level global skill directory.
-    # This deliberately never writes into a mounted project's .agents folder.
-    from pathlib import Path
-
+    # Register bundled skills in AGY's native directory inside the dedicated
+    # worker home. This deliberately never writes into a mounted project's
+    # .agents folder or mounts a root account's state into the worker.
     from bot.services.skill_registry import SkillRegistryError, ensure_global_skills
+    from bot.services.worker_sandbox import worker_skills_directory
 
     try:
         skill_report = ensure_global_skills(
-            target_dir=Path(settings.agy_global_skills_dir),
+            target_dir=worker_skills_directory(),
         )
     except SkillRegistryError as exc:
         logger.error("Cannot register bundled AGY skills: %s", exc)
