@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -23,7 +24,9 @@ from bot.services.memory_mcp_config import (
     MEMORY_MCP_SERVER_NAME,
     MemoryMcpConfigError,
     ensure_memory_mcp_config,
+    repair_invalid_memory_mcp_config,
 )
+from bot.services.memory_mcp_config import main as memory_mcp_config_main
 
 
 def _bootstrap_database(path: Path) -> None:
@@ -282,6 +285,85 @@ def test_invalid_mcp_config_is_not_overwritten(tmp_path: Path) -> None:
         )
 
     assert config_path.read_text(encoding="utf-8") == original
+
+
+def test_repair_invalid_mcp_config_preserves_private_backup(tmp_path: Path) -> None:
+    config_path = tmp_path / "mcp_config.json"
+    original = b'{"mcpServers": {"other": '
+    config_path.write_bytes(original)
+
+    report = repair_invalid_memory_mcp_config(
+        config_path=config_path,
+        python_executable=Path(sys.executable),
+        bot_root=ROOT / "antigravity-bot",
+        db_path="/tmp/bot.db",
+    )
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    server = payload["mcpServers"][MEMORY_MCP_SERVER_NAME]
+    assert report.config_path == config_path
+    assert report.backup_path.read_bytes() == original
+    assert stat.S_IMODE(report.backup_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+    assert server["command"] == str(Path(sys.executable).resolve())
+    assert server["args"][-2:] == ["--db-path", "/tmp/bot.db"]
+
+
+def test_repair_invalid_mcp_config_refuses_valid_user_config(tmp_path: Path) -> None:
+    config_path = tmp_path / "mcp_config.json"
+    original = json.dumps(
+        {"mcpServers": {"other": {"command": "node", "args": ["x"]}}}
+    )
+    config_path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(MemoryMcpConfigError, match="already valid"):
+        repair_invalid_memory_mcp_config(
+            config_path=config_path,
+            python_executable=Path(sys.executable),
+            bot_root=ROOT / "antigravity-bot",
+            db_path="/tmp/bot.db",
+        )
+
+    assert config_path.read_text(encoding="utf-8") == original
+    assert not list(tmp_path.glob("mcp_config.json.invalid-*.bak"))
+
+
+def test_repair_invalid_mcp_config_does_not_hide_schema_error(tmp_path: Path) -> None:
+    config_path = tmp_path / "mcp_config.json"
+    original = json.dumps({"mcpServers": []})
+    config_path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(MemoryMcpConfigError, match="non-syntax"):
+        repair_invalid_memory_mcp_config(
+            config_path=config_path,
+            python_executable=Path(sys.executable),
+            bot_root=ROOT / "antigravity-bot",
+            db_path="/tmp/bot.db",
+        )
+
+    assert config_path.read_text(encoding="utf-8") == original
+
+
+def test_repair_invalid_mcp_config_cli_uses_configured_runtime_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from bot.config import settings
+
+    config_path = tmp_path / "mcp_config.json"
+    config_path.write_text('{"mcpServers":', encoding="utf-8")
+    monkeypatch.setattr(settings, "agy_mcp_config_path", str(config_path))
+    monkeypatch.setattr(settings, "db_path", str(tmp_path / "bot.db"))
+
+    assert memory_mcp_config_main(["repair-invalid"]) == 0
+    output = capsys.readouterr().out
+
+    assert "MCP config repaired:" in output
+    assert "Original config backup (0600):" in output
+    assert MEMORY_MCP_SERVER_NAME in json.loads(
+        config_path.read_text(encoding="utf-8")
+    )["mcpServers"]
 
 
 def test_memory_mcp_configuration_failure_does_not_stop_the_bot(

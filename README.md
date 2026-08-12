@@ -39,6 +39,17 @@ Telegram bot integration for **Antigravity CLI** agent execution, featuring mult
 5. Keep `TASK_WORKSPACES_DIR` outside mounted repositories. Tracked and non-ignored files are copied there for each code task; ignored secrets such as `.env` are excluded.
 6. Install dependencies: `pip install -r antigravity-bot/requirements.txt`.
 
+If the startup log says that the MCP config is invalid, the bot remains available
+but native memory tools are disabled. Do not delete or paste the config into chat.
+After updating to a version that includes the repair command, run this explicit
+local operation from the repository root:
+
+    PYTHONPATH=antigravity-bot python -m bot.services.memory_mcp_config repair-invalid
+
+It creates an owner-only (0600) backup of the unreadable original and writes a
+minimal valid config containing only the bot's memory MCP server. Restart the bot
+afterwards.
+
 ## IDE Workflow Commands
 
 Inside a project forum topic the bot exposes a Telegram IDE workflow:
