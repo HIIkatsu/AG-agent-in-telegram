@@ -528,17 +528,19 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
             mode_config = get_mode_config(mode)
             web_search = effective_web_policy(session.get("web_search"), mode_config["web"])
 
-            # Deterministic valid UUIDv5 based on thread_id
+            # Use the durable per-topic session UUID as the namespace for AGY
+            # projects.  Telegram thread IDs are only scoped to a chat, and
+            # reusing a long-lived AGY project with --continue makes old tool
+            # failures part of every later prompt.  A fresh task project keeps
+            # each Telegram topic isolated while the bot still injects the
+            # bounded, topic-scoped memory selected above.
             import uuid as _uuid
-            _NAMESPACE_TG = _uuid.UUID('6ba7b810-9ed0-11d1-80b4-00c04fd430c8')
+            _NAMESPACE_AGY_PROJECT = _uuid.UUID('6ba7b810-9ed0-11d1-80b4-00c04fd430c8')
+            session_uuid = str(session.get("uuid") or f"thread-{thread_id}")
             conversation_id = str(
                 _uuid.uuid5(
-                    _NAMESPACE_TG,
-                    (
-                        f"thread-{thread_id}"
-                        if execution_profile == "chat"
-                        else f"thread-{thread_id}-task-{task_id}"
-                    ),
+                    _NAMESPACE_AGY_PROJECT,
+                    f"session-{session_uuid}-task-{task_id}",
                 )
             )
 

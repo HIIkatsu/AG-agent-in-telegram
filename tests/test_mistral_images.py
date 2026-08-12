@@ -159,3 +159,46 @@ def test_custom_mistral_endpoint_host_is_allowed_for_its_image_download() -> Non
         "gateway.custom-mistral.example",
         "images.custom-mistral.example",
     }
+
+
+def test_generated_image_accepts_inline_base64_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = MistralImageClient(
+        api_key="private-key",
+        api_url="https://api.mistral.ai/v1/chat/completions",
+        model="mistral-small-latest",
+        allowed_download_hosts={"files.mistral.ai"},
+        timeout_seconds=30,
+        max_file_bytes=1024,
+    )
+
+    async def fake_completion(_session, _prompt: str) -> object:
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {
+                                "mime_type": "image/png",
+                                "b64_json": "iVBORw0KGgpleGFtcGxlLWltYWdl",
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+    async def fail_download(*_args) -> tuple[bytes, str | None]:
+        raise AssertionError("inline image should not require URL download")
+
+    monkeypatch.setattr(client, "_post_completion", fake_completion)
+    monkeypatch.setattr(client, "_download_image", fail_download)
+
+    artifacts = tmp_path / "task-92"
+    artifacts.mkdir()
+    images = asyncio.run(client.generate("кот", artifacts))
+
+    assert [image.filename for image in images] == ["mistral-image-1.png"]
+    assert (artifacts / "mistral-image-1.png").read_bytes() == _PNG
