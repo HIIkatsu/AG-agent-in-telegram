@@ -69,7 +69,7 @@ the example UID `65534`; put its numeric UID and GID into `.env` as
 `AGY_WORKER_UID` and `AGY_WORKER_GID`.
 
 ```bash
-apt-get update && apt-get install -y bubblewrap
+apt-get update && apt-get install -y bubblewrap util-linux
 useradd --system --create-home \
   --home-dir /opt/antigravity-bot/agy-worker-home \
   --shell /usr/sbin/nologin agyworker
@@ -112,10 +112,18 @@ uses `ag-ssh`; its only possible operations are listing configured names,
 showing the public key, and submitting one remote command for an explicit
 Telegram approval.
 
+The systemd bot service must run as root only to let Bubblewrap construct the
+mount, PID, IPC and UTS namespaces. Immediately before AGY starts, the
+in-sandbox launcher uses `setpriv` to switch to `AGY_WORKER_UID:GID`, clear all
+supplementary groups and capability paths, and set `no_new_privs`. This avoids
+depending on unprivileged user namespaces, which many VPS kernels deliberately
+disable. AGY itself remains the non-root `agyworker` and sees only the explicit
+mounts.
+
 The short-lived capability socket is reachable only through that task's mounted
 directory and every request carries a fresh 256-bit token. This is deliberate:
-Bubblewrap can remap user IDs, so the token—not a fragile host UID mapping—is
-the authorization boundary. The token disappears together with the task.
+the token—not filesystem ownership alone—is the authorization boundary. The
+token disappears together with the task.
 
 Add trusted host keys before enabling a remote environment. Verify each server
 fingerprint against a trusted provider console or an administrator first; do

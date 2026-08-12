@@ -21,7 +21,7 @@ from bot.config import settings
 from bot.services import capability_broker
 
 
-def test_broker_parent_is_unlistable_but_traversable_by_the_worker(
+def test_broker_parent_stays_private_while_its_task_child_is_traversable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -50,7 +50,7 @@ def test_broker_parent_is_unlistable_but_traversable_by_the_worker(
     async def exercise() -> None:
         endpoint = await broker.start()
         try:
-            assert stat.S_IMODE(root.stat().st_mode) == 0o711
+            assert stat.S_IMODE(root.stat().st_mode) == 0o700
             assert stat.S_IMODE(endpoint.mount_dir.stat().st_mode) == 0o711
         finally:
             await broker.close()

@@ -119,11 +119,11 @@ def check_startup() -> None:
     # setup error until the dedicated worker is provisioned.
     from bot.services.worker_sandbox import (
         WorkerSandboxError,
-        validate_sandbox_configuration,
+        validate_sandbox_runtime,
     )
 
     try:
-        validate_sandbox_configuration()
+        validate_sandbox_runtime()
     except WorkerSandboxError as exc:
         logger.error(
             "AGY sandbox is not ready; tasks will fail closed until it is provisioned: %s",

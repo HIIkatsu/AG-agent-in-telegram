@@ -14,7 +14,6 @@ import os
 import stat
 import subprocess
 import tempfile
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,8 +32,7 @@ _SANDBOX_CLIENT_DIR = "/opt/ag-worker-tools"
 _SANDBOX_CLIENT_PATH = "/opt/ag-worker-tools/capability_client.py"
 _SANDBOX_MCP_CONFIG = f"{_SANDBOX_HOME}/.gemini/config/mcp_config.json"
 _SANDBOX_AGY_SCRATCH = f"{_SANDBOX_HOME}/.gemini/antigravity-cli/scratch"
-_SANDBOX_UID = 0
-_SANDBOX_GID = 0
+_SETPRIV_BINARY = "/usr/bin/setpriv"
 
 
 class WorkerSandboxError(RuntimeError):
@@ -48,7 +46,6 @@ class SandboxLaunch:
     command: tuple[str, ...]
     env: dict[str, str]
     cwd: str
-    preexec_fn: Callable[[], None] | None = None
 
 
 def _resolved_existing(path: str | Path, label: str, *, executable: bool = False) -> Path:
@@ -87,31 +84,48 @@ def worker_skills_directory() -> Path:
     return Path(settings.agy_worker_home).expanduser() / ".gemini/antigravity-cli/skills"
 
 
-def _worker_launch_preexec() -> Callable[[], None] | None:
-    """Run Bubblewrap as the dedicated host worker, never as the bot user.
+def _require_root_launcher() -> None:
+    """Require the trusted bot service to construct the mount sandbox.
 
-    Bubblewrap maps the UID of *its caller* into a new user namespace. Starting
-    it as root and then asking for UID 999 creates an unmapped identity on many
-    systems, which cannot access the worker-owned home directory. Dropping to
-    the worker before ``exec(bwrap)`` maps the intended host identity to root
-    *inside* the namespace; root there has no host-root authority and sees only
-    the deliberately mounted files.
+    Several VPS kernels correctly disable *unprivileged* user namespaces.  AGY
+    must therefore not execute Bubblewrap as ``agyworker``.  The bot service
+    starts Bubblewrap as root solely to create the filesystem, PID, IPC and UTS
+    namespaces; the final command is then dropped to the dedicated host user by
+    :func:`_worker_privilege_drop_command`.  No bot secret path is mounted.
     """
-    uid, gid = _worker_ids()
-    current_uid, current_gid = os.geteuid(), os.getegid()
-    if current_uid == uid and current_gid == gid:
-        return None
-    if current_uid != 0:
+    if os.geteuid() != 0:
         raise WorkerSandboxError(
-            "Bot service must run as root or as AGY_WORKER_UID to launch Bubblewrap"
+            "Bot service must run as root to construct the AGY Bubblewrap sandbox"
         )
 
-    def drop_privileges() -> None:
-        os.setgroups([])
-        os.setgid(gid)
-        os.setuid(uid)
 
-    return drop_privileges
+def _worker_privilege_drop_command() -> list[str]:
+    """Return the immutable in-sandbox transition from root to ``agyworker``.
+
+    ``--uid`` and ``--gid`` are Bubblewrap user-namespace options; using them
+    would again require an unprivileged user namespace on the target VPS.  The
+    root-only Bubblewrap setup instead execs the system ``setpriv`` helper as
+    its final action.  It clears supplementary groups and every capability
+    route before AGY starts, so the model process has the real non-root host
+    identity required to write its own worker home.
+    """
+    uid, gid = _worker_ids()
+    launcher = _resolved_existing(
+        _SETPRIV_BINARY,
+        "AGY worker privilege-drop helper",
+        executable=True,
+    )
+    return [
+        str(launcher),
+        f"--reuid={uid}",
+        f"--regid={gid}",
+        "--clear-groups",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--bounding-set=-all",
+        "--no-new-privs",
+        "--",
+    ]
 
 
 def _require_worker_owned_directory(
@@ -330,11 +344,12 @@ def prepare_execution_directory(execution_dir: str) -> Path:
 
 def validate_sandbox_configuration() -> None:
     """Validate prerequisites without starting an AGY task or reading secrets."""
+    _require_root_launcher()
     _resolved_existing(settings.agy_sandbox_binary, "Bubblewrap executable", executable=True)
     _agy_source_and_sandbox_path()
     _worker_home()
     _worker_python()
-    _worker_launch_preexec()
+    _worker_privilege_drop_command()
     if not CAPABILITY_CLIENT.is_file():
         raise WorkerSandboxError(f"Capability client is missing: {CAPABILITY_CLIENT}")
 
@@ -360,12 +375,12 @@ def _write_sandbox_etc(capability_dir: Path) -> Path:
     """Create the few non-secret /etc files the isolated runtime needs."""
     target = capability_dir / "etc"
     target.mkdir(mode=0o755, exist_ok=True)
+    uid, gid = _worker_ids()
     files = {
-        # Bubblewrap maps the host agyworker identity to namespace root. The
-        # numeric host IDs must never be exposed as a misleading identity
-        # inside the namespace.
-        "passwd": f"agyworker:x:{_SANDBOX_UID}:{_SANDBOX_GID}:AGY worker:{_SANDBOX_HOME}:/usr/sbin/nologin\n",
-        "group": f"agyworker:x:{_SANDBOX_GID}:\n",
+        # AGY runs as this real non-root host identity after setpriv.  The
+        # generated files contain no host users, groups or service accounts.
+        "passwd": f"agyworker:x:{uid}:{gid}:AGY worker:{_SANDBOX_HOME}:/usr/sbin/nologin\n",
+        "group": f"agyworker:x:{gid}:\n",
         "hosts": "127.0.0.1 localhost\n::1 localhost\n",
         "nsswitch.conf": "passwd: files\ngroup: files\nhosts: files dns\n",
     }
@@ -441,12 +456,6 @@ def build_sandbox_launch(
         str(_resolved_existing(settings.agy_sandbox_binary, "Bubblewrap executable", executable=True)),
         "--die-with-parent",
         "--new-session",
-        "--unshare-user",
-        "--uid",
-        str(_SANDBOX_UID),
-        "--gid",
-        str(_SANDBOX_GID),
-        "--disable-userns",
         "--unshare-pid",
         "--unshare-ipc",
         "--unshare-uts",
@@ -577,6 +586,7 @@ def build_sandbox_launch(
             "--chdir",
             _SANDBOX_WORKSPACE,
             "--",
+            *_worker_privilege_drop_command(),
             sandbox_agy_path,
             *sandbox_agy_args[1:],
         ]
@@ -585,7 +595,6 @@ def build_sandbox_launch(
         command=tuple(command),
         env=_sandbox_environment(thread_id),
         cwd=str(workspace),
-        preexec_fn=_worker_launch_preexec(),
     )
 
 
@@ -607,28 +616,25 @@ def build_unsandboxed_development_launch(
 
 
 def _bubblewrap_probe_command() -> list[str]:
-    """Build a minimal process that exercises the worker's runtime mounts.
+    """Build a minimal process that exercises the real privilege transition.
 
-    ``/usr/bin/true`` is dynamically linked on normal Linux distributions.
+    ``/usr/bin/id`` is dynamically linked on normal Linux distributions.
     Mounting only ``/usr`` makes ``execvp`` misleadingly report that it cannot
     find the binary because its dynamic loader under ``/lib`` or ``/lib64`` is
-    absent. Keep this probe aligned with the runtime mounts used by an AGY task.
+    absent.  The probe also bind-mounts the worker home and runs ``id -u`` via
+    ``setpriv``.  It catches both missing namespace privileges and a launcher
+    that accidentally leaves AGY as root before a real task is accepted.
     """
     binary = _resolved_existing(
         settings.agy_sandbox_binary,
         "Bubblewrap executable",
         executable=True,
     )
+    worker_home = _worker_home()
     probe = [
         str(binary),
         "--die-with-parent",
         "--new-session",
-        "--unshare-user",
-        "--uid",
-        str(_SANDBOX_UID),
-        "--gid",
-        str(_SANDBOX_GID),
-        "--disable-userns",
         "--unshare-pid",
         "--unshare-ipc",
         "--unshare-uts",
@@ -640,6 +646,11 @@ def _bubblewrap_probe_command() -> list[str]:
         "/dev",
         "--tmpfs",
         "/tmp",
+        "--dir",
+        "/home",
+        "--bind",
+        str(worker_home),
+        _SANDBOX_HOME,
     ]
     for raw_path in ("/usr", "/bin", "/lib", "/lib64"):
         source = Path(raw_path)
@@ -651,15 +662,22 @@ def _bubblewrap_probe_command() -> list[str]:
             "--setenv",
             "PATH",
             "/usr/bin:/bin",
+            "--setenv",
+            "HOME",
+            _SANDBOX_HOME,
+            "--chdir",
+            _SANDBOX_HOME,
             "--",
-            "/usr/bin/true",
+            *_worker_privilege_drop_command(),
+            "/usr/bin/id",
+            "-u",
         ]
     )
     return probe
 
 
 def _verify_bubblewrap_runtime() -> None:
-    """Run a harmless namespace probe as the actual worker identity."""
+    """Run a harmless namespace probe and prove AGY will have the worker UID."""
     probe = _bubblewrap_probe_command()
     try:
         result = subprocess.run(
@@ -668,13 +686,25 @@ def _verify_bubblewrap_runtime() -> None:
             text=True,
             timeout=10,
             check=False,
-            preexec_fn=_worker_launch_preexec(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise WorkerSandboxError(f"Bubblewrap probe failed: {exc}") from exc
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "unknown Bubblewrap error").strip()
         raise WorkerSandboxError(f"Bubblewrap namespace probe failed: {detail[:500]}")
+    expected_uid, _ = _worker_ids()
+    actual_uid = result.stdout.strip()
+    if actual_uid != str(expected_uid):
+        raise WorkerSandboxError(
+            "Bubblewrap namespace probe did not drop to AGY_WORKER_UID: "
+            f"expected {expected_uid}, got {actual_uid or 'no output'}"
+        )
+
+
+def validate_sandbox_runtime() -> None:
+    """Validate config and execute the non-destructive end-to-end probe."""
+    validate_sandbox_configuration()
+    _verify_bubblewrap_runtime()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -687,9 +717,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        validate_sandbox_configuration()
         if args.verify_runtime:
-            _verify_bubblewrap_runtime()
+            validate_sandbox_runtime()
+        else:
+            validate_sandbox_configuration()
     except WorkerSandboxError as exc:
         print(f"AGY sandbox is not ready: {exc}")
         return 2

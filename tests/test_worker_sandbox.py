@@ -58,6 +58,10 @@ def _configure_worker(
     # chown to 65534. Exercise the launch builder with its current identity;
     # production still reaches the real non-root validation in _worker_ids.
     monkeypatch.setattr(worker_sandbox, "_worker_ids", lambda: (uid, gid))
+    # CI normally runs as an unprivileged account.  Unit tests exercise the
+    # command builder, while production explicitly requires the root-owned bot
+    # service to construct the mount namespace before it drops to agyworker.
+    monkeypatch.setattr(worker_sandbox, "_require_root_launcher", lambda: None)
     monkeypatch.setattr(settings, "task_workspaces_dir", str(task_root))
     monkeypatch.setattr(settings, "task_artifacts_dir", str(artifacts_root))
     return task_root, capability_root, artifacts_root
@@ -98,12 +102,12 @@ def test_sandbox_launch_strips_bot_environment_and_exposes_only_capabilities(
     )
 
     command = list(launch.command)
-    assert "--unshare-user" in command
-    assert "--disable-userns" in command
+    assert "--unshare-user" not in command
+    assert "--disable-userns" not in command
     assert "--unshare-pid" in command
     assert "--clearenv" in command
-    assert command[command.index("--uid") + 1] == "0"
-    assert command[command.index("--gid") + 1] == "0"
+    assert "--uid" not in command
+    assert "--gid" not in command
     assert "--bind" in command
     assert str(workspace) in command
     assert "/workspace" in command
@@ -134,10 +138,22 @@ def test_sandbox_launch_strips_bot_environment_and_exposes_only_capabilities(
     assert "AGY_BOT_DB_PATH" not in launch.env
     assert "do-not-leak-this-token" not in launch.env.values()
     assert "per-task-secret" not in launch.env.values()
-    assert launch.preexec_fn is None
+    assert not hasattr(launch, "preexec_fn")
 
     command_start = command.index("--") + 1
     assert str(workspace) not in command[command_start:]
+    uid, gid = _worker_identity()
+    assert command[command_start : command_start + 9] == [
+        "/usr/bin/setpriv",
+        f"--reuid={uid}",
+        f"--regid={gid}",
+        "--clear-groups",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--bounding-set=-all",
+        "--no-new-privs",
+        "--",
+    ]
 
     mcp_config = json.loads((capability_root / "mcp_config.json").read_text())
     server = mcp_config["mcpServers"]["ag-telegram-memory"]
@@ -153,6 +169,9 @@ def test_sandbox_launch_strips_bot_environment_and_exposes_only_capabilities(
     assert "root:" not in (capability_root / "etc" / "passwd").read_text(
         encoding="utf-8"
     )
+    assert f"agyworker:x:{uid}:{gid}:" in (
+        capability_root / "etc" / "passwd"
+    ).read_text(encoding="utf-8")
 
 
 def test_sandbox_refuses_an_unmanaged_execution_directory(
@@ -244,7 +263,7 @@ def test_sandbox_rewrites_add_dir_to_its_workspace(
     command = list(launch.command)
     command_start = command.index("--") + 1
     inner_command = command[command_start:]
-    assert inner_command == [
+    assert inner_command[-5:] == [
         "/usr/bin/true",
         "--add-dir",
         "/workspace",
@@ -261,16 +280,31 @@ def test_production_worker_identity_cannot_be_root(monkeypatch: pytest.MonkeyPat
         worker_sandbox._worker_ids()
 
 
-def test_root_service_launches_bubblewrap_as_the_dedicated_worker(
+def test_root_service_is_required_to_construct_the_bubblewrap_mount_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_sandbox.os, "geteuid", lambda: 999)
+
+    with pytest.raises(worker_sandbox.WorkerSandboxError, match="must run as root"):
+        worker_sandbox._require_root_launcher()
+
+
+def test_privilege_drop_command_clears_worker_privileges(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(worker_sandbox, "_worker_ids", lambda: (999, 988))
-    monkeypatch.setattr(worker_sandbox.os, "geteuid", lambda: 0)
-    monkeypatch.setattr(worker_sandbox.os, "getegid", lambda: 0)
 
-    preexec = worker_sandbox._worker_launch_preexec()
-
-    assert preexec is not None
+    assert worker_sandbox._worker_privilege_drop_command() == [
+        "/usr/bin/setpriv",
+        "--reuid=999",
+        "--regid=988",
+        "--clear-groups",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--bounding-set=-all",
+        "--no-new-privs",
+        "--",
+    ]
 
 
 def test_worker_home_rejects_root_owned_internal_directory(
@@ -309,18 +343,44 @@ def test_worker_home_rejects_non_writable_internal_directory(
 
 
 def test_bubblewrap_probe_includes_the_dynamic_loader_runtime(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _configure_worker(tmp_path, monkeypatch)
     monkeypatch.setattr(settings, "agy_sandbox_binary", "/usr/bin/true")
-    monkeypatch.setattr(settings, "agy_worker_uid", 999)
-    monkeypatch.setattr(settings, "agy_worker_gid", 988)
 
     command = worker_sandbox._bubblewrap_probe_command()
 
     assert command[:3] == ["/usr/bin/true", "--die-with-parent", "--new-session"]
+    assert "--unshare-user" not in command
+    assert "--uid" not in command
+    assert "--gid" not in command
     assert "--clearenv" in command
     assert _ro_bind_index(command, "/usr", "/usr")
     assert _ro_bind_index(command, "/bin", "/bin")
     assert _ro_bind_index(command, "/lib", "/lib")
     assert _ro_bind_index(command, "/lib64", "/lib64")
-    assert command[-2:] == ["--", "/usr/bin/true"]
+    assert any(
+        command[index : index + 3]
+        == ["--bind", str(Path(settings.agy_worker_home)), "/home/agy"]
+        for index in range(len(command) - 2)
+    )
+    assert "/usr/bin/setpriv" in command
+    assert command[-2:] == ["/usr/bin/id", "-u"]
+
+
+def test_runtime_probe_rejects_a_process_that_did_not_drop_to_worker_uid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_sandbox, "_worker_ids", lambda: (999, 988))
+    monkeypatch.setattr(worker_sandbox, "_bubblewrap_probe_command", lambda: ["probe"])
+    monkeypatch.setattr(
+        worker_sandbox.subprocess,
+        "run",
+        lambda *_args, **_kwargs: worker_sandbox.subprocess.CompletedProcess(
+            ["probe"], 0, stdout="0\n", stderr=""
+        ),
+    )
+
+    with pytest.raises(worker_sandbox.WorkerSandboxError, match="did not drop"):
+        worker_sandbox._verify_bubblewrap_runtime()
