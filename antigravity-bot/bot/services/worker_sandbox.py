@@ -69,16 +69,77 @@ def _worker_ids() -> tuple[int, int]:
     return uid, gid
 
 
+def _require_worker_owned_directory(
+    path: Path,
+    label: str,
+    *,
+    uid: int,
+    gid: int,
+) -> None:
+    """Require a real private directory that AGY can update as its worker user.
+
+    AGY creates its installation identifier, logs and crash reports below its
+    home directory before it can make a request.  Checking only the top-level
+    home is insufficient: ``install -d`` can leave intermediate directories
+    owned by root, which otherwise turns into a confusing first-task failure.
+    """
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise WorkerSandboxError(f"{label} cannot be inspected: {exc}") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise WorkerSandboxError(f"{label} must not be a symbolic link: {path}")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise WorkerSandboxError(f"{label} is not a directory: {path}")
+    if metadata.st_uid != uid or metadata.st_gid != gid:
+        raise WorkerSandboxError(
+            f"{label} must be owned by AGY_WORKER_UID:AGY_WORKER_GID: {path}"
+        )
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (mode & stat.S_IRWXU) != stat.S_IRWXU:
+        raise WorkerSandboxError(f"{label} must grant the AGY worker access: {path}")
+    if mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise WorkerSandboxError(f"{label} must not be group- or world-writable: {path}")
+
+
+def _require_worker_owned_file(
+    path: Path,
+    label: str,
+    *,
+    uid: int,
+    gid: int,
+) -> None:
+    """Require the worker-owned MCP placeholder without following symlinks."""
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise WorkerSandboxError(f"{label} cannot be inspected: {exc}") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise WorkerSandboxError(f"{label} must not be a symbolic link: {path}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise WorkerSandboxError(f"{label} is not a regular file: {path}")
+    if metadata.st_uid != uid or metadata.st_gid != gid:
+        raise WorkerSandboxError(
+            f"{label} must be owned by AGY_WORKER_UID:AGY_WORKER_GID: {path}"
+        )
+    mode = stat.S_IMODE(metadata.st_mode)
+    if not (mode & stat.S_IRUSR) or not (mode & stat.S_IWUSR):
+        raise WorkerSandboxError(
+            f"{label} must be readable and writable by the AGY worker: {path}"
+        )
+    if mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise WorkerSandboxError(f"{label} must not be group- or world-writable: {path}")
+
+
 def _worker_home() -> Path:
     uid, gid = _worker_ids()
     home = _require_directory(settings.agy_worker_home, "AGY worker home")
-    metadata = home.stat()
-    if metadata.st_uid != uid or metadata.st_gid != gid:
-        raise WorkerSandboxError(
-            "AGY worker home must be owned by AGY_WORKER_UID:AGY_WORKER_GID"
-        )
-    if stat.S_IMODE(metadata.st_mode) & stat.S_IWOTH:
-        raise WorkerSandboxError("AGY worker home must not be world-writable")
+    _require_worker_owned_directory(
+        home,
+        "AGY worker home",
+        uid=uid,
+        gid=gid,
+    )
     for relative in (
         ".gemini",
         ".gemini/config",
@@ -86,16 +147,19 @@ def _worker_home() -> Path:
         ".gemini/antigravity-cli/skills",
     ):
         target = home / relative
-        if not target.is_dir():
-            raise WorkerSandboxError(
-                f"AGY worker home is missing required directory: {target}"
-            )
-    mcp_config = home / ".gemini/config/mcp_config.json"
-    if not mcp_config.is_file():
-        raise WorkerSandboxError(
-            "AGY worker home is missing required MCP config placeholder: "
-            f"{mcp_config}"
+        _require_worker_owned_directory(
+            target,
+            "AGY worker home directory",
+            uid=uid,
+            gid=gid,
         )
+    mcp_config = home / ".gemini/config/mcp_config.json"
+    _require_worker_owned_file(
+        mcp_config,
+        "AGY worker home MCP config placeholder",
+        uid=uid,
+        gid=gid,
+    )
     return home
 
 
