@@ -24,6 +24,8 @@ def test_plain_question_uses_fast_chat() -> None:
 
 def test_project_mutation_uses_code_profile() -> None:
     assert classify_execution_profile("Исправь файл bot/main.py и запусти тесты") == "code"
+    assert classify_execution_profile("Почини ошибку в обработчике и проверь") == "code"
+    assert classify_execution_profile("Сделай простую HTML-страницу") == "code"
     assert classify_execution_profile("Посмотри вложение", has_attachments=True) == "code"
 
 

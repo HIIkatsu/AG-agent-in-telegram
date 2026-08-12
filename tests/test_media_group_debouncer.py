@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "antigravity-bot"))
 os.environ.setdefault("BOT_TOKEN", "123456:test-token")
 os.environ.setdefault("ALLOWED_USER_IDS", "1")
 
-from bot.handlers import message as message_handler
+from bot.handlers import message as message_handler  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -63,3 +63,43 @@ def test_message_without_media_group_keeps_fast_path():
         message, object(), "uploads/single.jpg", None
     )
     assert message_handler._media_groups == {}
+
+
+@pytest.fixture(autouse=True)
+def clear_text_groups():
+    message_handler._text_groups.clear()
+    yield
+    for group in message_handler._text_groups.values():
+        if group.timer is not None:
+            group.timer.cancel()
+    message_handler._text_groups.clear()
+
+
+def test_consecutive_text_fragments_are_enqueued_as_one_task(monkeypatch):
+    process = AsyncMock()
+    monkeypatch.setattr(message_handler, "_process", process)
+    monkeypatch.setattr(message_handler, "_TEXT_DEBOUNCE_SECONDS", 0.01)
+
+    async def exercise_debouncer():
+        bot = object()
+        user = SimpleNamespace(id=99)
+        first = SimpleNamespace(
+            chat=SimpleNamespace(id=10),
+            message_thread_id=7,
+            from_user=user,
+        )
+        second = SimpleNamespace(
+            chat=SimpleNamespace(id=10),
+            message_thread_id=7,
+            from_user=user,
+        )
+
+        message_handler._buffer_text_message(first, bot, "первая часть")
+        message_handler._buffer_text_message(second, bot, "вторая часть")
+
+        await asyncio.sleep(0.03)
+
+        process.assert_awaited_once_with(first, "первая часть\nвторая часть", bot)
+        assert message_handler._text_groups == {}
+
+    asyncio.run(exercise_debouncer())
