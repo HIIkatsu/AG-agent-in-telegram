@@ -456,23 +456,61 @@ def build_unsandboxed_development_launch(
     return SandboxLaunch(command=tuple(agy_args), env=env, cwd=execution_dir)
 
 
-def _verify_bubblewrap_runtime() -> None:
-    """Run a harmless namespace probe for deployment preflight."""
-    binary = _resolved_existing(settings.agy_sandbox_binary, "Bubblewrap executable", executable=True)
+def _bubblewrap_probe_command() -> list[str]:
+    """Build a minimal process that exercises the worker's runtime mounts.
+
+    ``/usr/bin/true`` is dynamically linked on normal Linux distributions.
+    Mounting only ``/usr`` makes ``execvp`` misleadingly report that it cannot
+    find the binary because its dynamic loader under ``/lib`` or ``/lib64`` is
+    absent. Keep this probe aligned with the runtime mounts used by an AGY task.
+    """
+    binary = _resolved_existing(
+        settings.agy_sandbox_binary,
+        "Bubblewrap executable",
+        executable=True,
+    )
     probe = [
         str(binary),
         "--die-with-parent",
+        "--new-session",
         "--unshare-user",
         "--uid",
         str(settings.agy_worker_uid),
         "--gid",
         str(settings.agy_worker_gid),
+        "--disable-userns",
         "--unshare-pid",
-        "--ro-bind",
-        "/usr",
-        "/usr",
-        "/usr/bin/true",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--hostname",
+        "agy-worker-probe",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
     ]
+    for raw_path in ("/usr", "/bin", "/lib", "/lib64"):
+        source = Path(raw_path)
+        if source.exists() or source.is_symlink():
+            probe.extend(["--ro-bind", raw_path, raw_path])
+    probe.extend(
+        [
+            "--clearenv",
+            "--setenv",
+            "PATH",
+            "/usr/bin:/bin",
+            "--",
+            "/usr/bin/true",
+        ]
+    )
+    return probe
+
+
+def _verify_bubblewrap_runtime() -> None:
+    """Run a harmless namespace probe for deployment preflight."""
+    probe = _bubblewrap_probe_command()
     try:
         result = subprocess.run(probe, capture_output=True, text=True, timeout=10, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
