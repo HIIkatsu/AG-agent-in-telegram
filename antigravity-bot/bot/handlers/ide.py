@@ -144,6 +144,11 @@ async def cmd_task_status(message: Message, command: CommandObject) -> None:
     if task_id is None:
         await message.answer("Задач пока нет.")
         return
+    from bot.services.task_service import get_task
+
+    if not await get_task(task_id, thread_id=thread_id):
+        await message.answer("Задача не найдена в этом проекте.")
+        return
     text, kb = await build_task_card(task_id)
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
@@ -157,6 +162,7 @@ async def cmd_cancel(message: Message) -> None:
     from bot.handlers.message import _active_tasks
     from bot.services.task_service import cancel_queue
 
+    cancelled_count = await cancel_queue(thread_id)
     entry = _active_tasks.get(thread_id)
     if entry:
         tracker, agy_task = entry
@@ -167,8 +173,10 @@ async def cmd_cancel(message: Message) -> None:
                 await agy_task
             except asyncio.CancelledError:
                 pass
-    await cancel_queue(thread_id)
-    await message.answer("⏹ Текущая задача и очередь отменены.")
+    if cancelled_count:
+        await message.answer("⏹ Текущая задача и очередь отменены.")
+    else:
+        await message.answer("Очередь уже пуста.")
 
 
 @router.message(Command("search"))
