@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
@@ -294,35 +295,37 @@ async def on_topic_closed(message: Message) -> None:
 # ── /cleanup — purge broken CLI sessions ────────────────────────────────
 
 def purge_stale_cli_sessions() -> int:
-    """Remove broken / stale CLI session dirs from ~/.gemini/antigravity-cli/.
+    """Remove malformed session directories only from AGY's ``brain`` store.
 
     Returns the number of purged entries.
     """
-    cli_dir = os.path.expanduser("~/.gemini/antigravity-cli")
-    if not os.path.isdir(cli_dir):
+    cli_dir = Path(os.path.expanduser("~/.gemini/antigravity-cli"))
+    brain_dir = cli_dir / "brain"
+    if not brain_dir.is_dir():
         return 0
 
-    # Sessions live in brain/<uuid> subdirs — scan there
+    # AGY sessions live in brain/<uuid>. Do not scan the parent directory: it
+    # also contains global skills, configuration and other user-owned state.
     import uuid as _uuid
-    _SYSTEM_DIRS = {"builtin", "brain", "knowledge", "updater", "bin",
-                    "scratch", "cache", "log", "implicit", "presence",
-                    "conversations", "crashes", "config"}
+
+    try:
+        entries = list(brain_dir.iterdir())
+    except OSError as exc:
+        logger.warning("Cannot inspect AGY session directory %s: %s", brain_dir, exc)
+        return 0
+
     purged = 0
-    for entry in os.listdir(cli_dir):
-        entry_path = os.path.join(cli_dir, entry)
-        if not os.path.isdir(entry_path):
+    for entry_path in entries:
+        if entry_path.is_symlink() or not entry_path.is_dir():
             continue
-        # Never touch known system directories
-        if entry in _SYSTEM_DIRS:
-            continue
-        # Try to parse as valid UUID — if it fails, it's a broken session
+        # Try to parse as valid UUID — if it fails, it is a broken session.
         try:
-            _uuid.UUID(entry)
+            _uuid.UUID(entry_path.name)
         except ValueError:
             try:
                 shutil.rmtree(entry_path, ignore_errors=True)
                 purged += 1
-                logger.info("Purged broken CLI session: %s", entry)
+                logger.info("Purged broken CLI session: %s", entry_path.name)
             except Exception as exc:
                 logger.warning("Failed to purge %s: %s", entry_path, exc)
     return purged

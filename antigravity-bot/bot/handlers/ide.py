@@ -8,7 +8,13 @@ from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from bot.config import settings
 from bot.db import db
@@ -243,33 +249,6 @@ async def cmd_context(message: Message, command: CommandObject) -> None:
     lines.append("\n<b>Заметки:</b>")
     lines += [f"• {html.escape(row['note'])}" for row in notes[:10]] or ["— пусто"]
     lines.append("\n<code>/context add path</code> · <code>/context rm path</code> · <code>/context note text</code> · <code>/context clear</code>")
-    await message.answer("\n".join(lines), parse_mode="HTML")
-
-
-@router.message(Command("memory"))
-async def cmd_memory(message: Message, command: CommandObject) -> None:
-    thread_id = _thread_id(message)
-    if thread_id is None:
-        await message.reply("Команда работает только внутри топика проекта.")
-        return
-    args = (command.args or "").strip()
-    if args.startswith("add "):
-        await db.add_memory_note(thread_id, args[4:].strip())
-        await message.answer("🧠 Запомнил для проекта.")
-        return
-    if args.startswith("rm "):
-        try:
-            note_id = int(args[3:].strip())
-        except ValueError:
-            await message.reply("Использование: /memory rm <id>")
-            return
-        await db.delete_memory_note(note_id, thread_id)
-        await message.answer("🧹 Заметка удалена.")
-        return
-    notes = await db.list_memory_notes(thread_id)
-    lines = ["🧠 <b>Память проекта</b>", ""]
-    lines += [f"<b>#{row['id']}</b> {html.escape(row['note'])}" for row in notes] or ["— пусто"]
-    lines.append("\n<code>/memory add текст</code> · <code>/memory rm id</code>")
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 

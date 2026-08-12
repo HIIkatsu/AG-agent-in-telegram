@@ -60,6 +60,11 @@ _BASE_RUNTIME_RULES = """\
 - ЗАПРЕЩЕНО упоминать или выводить пользователю технические пути системных папок
   (вроде /tmp/workspaces/..., /root/... или scratch).
   Просто подтверждай создание и описывай реализованный функционал.
+- При обычных пользовательских запросах ЗАПРЕЩЕНО запускать Python-, sqlite3- или
+  shell-скрипты для чтения либо изменения bot.db и запрещено импортировать bot.db
+  через python -c. Для работы с памятью используй нативные инструменты
+  save_memory, list_memory и delete_memory. Исключение — только явно поставленная
+  задача на разработку, миграцию или отладку самой БД этого бота.
 
 ## Behavior
 - Если пользователь задаёт вопрос — отвечай текстом, НЕ создавая файлы.
@@ -230,6 +235,7 @@ async def run_agy(
         "PYTHONIOENCODING": "utf-8",
         "AGY_BOT_ROOT": str(BOT_ROOT),
         "AGY_BOT_PYTHON": sys.executable,
+        "AGY_BOT_DB_PATH": settings.db_path,
         "AGY_TG_THREAD_ID": str(thread_id) if thread_id is not None else "",
         "AGY_TG_PROJECT_ID": project_id_str,
     }
@@ -421,7 +427,17 @@ def _tool_label(tool_name: str, parameters: dict) -> str:
         if file_param:
             return f"{action}: {os.path.basename(str(file_param))}"
         return str(action)
-        
+
+    memory_tool_labels = {
+        "save_memory": "Сохранение памяти",
+        "list_memory": "Чтение памяти",
+        "delete_memory": "Удаление из памяти",
+    }
+    for suffix, label in memory_tool_labels.items():
+        if tool_name.endswith(suffix):
+            scope = parameters.get("scope", "global")
+            return f"{label}: {scope}"
+
     labels = {
         "run_command": f"Выполнение: {parameters.get('CommandLine', '')[:50]}",
         "write_to_file": f"Запись файла: {os.path.basename(str(parameters.get('TargetFile', '')))}",

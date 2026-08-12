@@ -10,7 +10,7 @@ Telegram bot integration for **Antigravity CLI** agent execution, featuring mult
 - 🔄 **Task-scoped Git Safety**: Every code task runs in a private repository snapshot. Accept applies only that task's checked patch; Discard removes only its isolated workspace and never resets the mounted project.
 - 🛡️ **Runtime Rules**: Combines tracked `INSTRUCTIONS.md` policy with optional private `INSTRUCTIONS.local.md` context without modifying mounted projects.
 - 🧩 **Global Agent Skills**: Registers every bundled skill in AGY's user-level skill directory while leaving each mounted project's `.agents` directory untouched.
-- 🧠 **Global Memory**: Injects a fresh, bounded snapshot of durable user facts into every task; the `global-memory` skill can list, save, and delete facts.
+- 🧠 **Two-layer Memory**: Keeps global user facts and per-project notes separate; AGY uses native MCP tools to manage both without shell access to SQLite.
 
 ## Project Structure
 
@@ -35,8 +35,9 @@ Telegram bot integration for **Antigravity CLI** agent execution, featuring mult
 1. Copy `.env.example` to `.env` and fill in your Telegram Bot credentials.
 2. Optionally copy `antigravity-bot/INSTRUCTIONS.local.example.md` to `antigravity-bot/INSTRUCTIONS.local.md` and add private personal or infrastructure context. The local file is ignored by Git; never put secrets in it. Restart the bot after changing it so a new instruction snapshot and SHA-256 are loaded.
 3. Keep `AGY_GLOBAL_SKILLS_DIR` at AGY CLI's user-level default unless the service runs under a custom home directory. On startup the bot creates only manifest-managed skill copies there and refuses to overwrite user-owned or locally modified skills with the same names.
-4. Keep `TASK_WORKSPACES_DIR` outside mounted repositories. Tracked and non-ignored files are copied there for each code task; ignored secrets such as `.env` are excluded.
-5. Install dependencies: `pip install -r antigravity-bot/requirements.txt`.
+4. The bot registers its `ag-telegram-memory` MCP server in `AGY_MCP_CONFIG_PATH` on startup. Other MCP servers in that file are preserved; a conflicting server with that exact name is refused rather than overwritten.
+5. Keep `TASK_WORKSPACES_DIR` outside mounted repositories. Tracked and non-ignored files are copied there for each code task; ignored secrets such as `.env` are excluded.
+6. Install dependencies: `pip install -r antigravity-bot/requirements.txt`.
 
 ## IDE Workflow Commands
 
@@ -46,7 +47,7 @@ Inside a project forum topic the bot exposes a Telegram IDE workflow:
 - `/files` — browse and open workspace files.
 - `/search <query>` — ripgrep-based filename/content search with ignored build/cache directories.
 - `/context` — show context; `/context add path`, `/context rm path`, `/context note text`, `/context clear` manage pinned task context.
-- `/memory` — inspect and delete global user memory; agents can update it through the `global-memory` skill when explicitly asked.
+- `/memory` — shows two blocks: notes for the current project and global user memory. `/memory add <text>` and `/memory rm <id>` manage the current project's notes; the agent manages global facts through native memory tools when explicitly asked.
 - `/diff` — inspect the mounted project's current Git state without changing its index or refs.
 - `/test` — auto-detect and run the project test command.
 - `/run <command>` — run a managed command in the workspace and stream output.

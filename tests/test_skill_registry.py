@@ -68,6 +68,17 @@ def test_all_required_bundled_skills_remain_native_skill_packages() -> None:
     )
 
 
+def test_global_memory_skill_uses_native_memory_tools() -> None:
+    skill = (ROOT / "antigravity-bot" / ".agents" / "skills" / "global-memory" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "save_memory" in skill
+    assert "list_memory" in skill
+    assert "delete_memory" in skill
+    assert "bot.services.memory_tools" not in skill
+
+
 def test_registry_installs_the_complete_bundled_library(tmp_path: Path) -> None:
     source = ROOT / "antigravity-bot" / ".agents" / "skills"
     target = tmp_path / "global"
