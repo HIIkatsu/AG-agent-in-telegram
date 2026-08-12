@@ -45,6 +45,115 @@ def _expected_server(
     }
 
 
+def _strip_jsonc_comments(raw: str) -> str:
+    """Remove JSONC comments without touching comment-like text in strings."""
+    result: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+
+    while index < len(raw):
+        char = raw[index]
+        next_char = raw[index + 1] if index + 1 < len(raw) else ""
+
+        if in_string:
+            result.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+
+        if char == '"':
+            in_string = True
+            result.append(char)
+            index += 1
+            continue
+
+        if char == "/" and next_char == "/":
+            index += 2
+            while index < len(raw) and raw[index] not in "\r\n":
+                index += 1
+            continue
+
+        if char == "/" and next_char == "*":
+            index += 2
+            while index < len(raw):
+                if raw[index] == "*" and index + 1 < len(raw) and raw[index + 1] == "/":
+                    index += 2
+                    break
+                # Keep line boundaries so parser errors remain understandable.
+                if raw[index] in "\r\n":
+                    result.append(raw[index])
+                index += 1
+            else:
+                raise ValueError("unterminated JSONC block comment")
+            continue
+
+        result.append(char)
+        index += 1
+
+    return "".join(result)
+
+
+def _strip_jsonc_trailing_commas(raw: str) -> str:
+    """Remove trailing commas outside strings, as allowed by JSONC."""
+    result: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+
+    while index < len(raw):
+        char = raw[index]
+        if in_string:
+            result.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+
+        if char == '"':
+            in_string = True
+            result.append(char)
+            index += 1
+            continue
+
+        if char == ",":
+            lookahead = index + 1
+            while lookahead < len(raw) and raw[lookahead].isspace():
+                lookahead += 1
+            if lookahead < len(raw) and raw[lookahead] in "]}":
+                index += 1
+                continue
+
+        result.append(char)
+        index += 1
+
+    return "".join(result)
+
+
+def _load_json_or_jsonc(raw: str, config_path: Path) -> object:
+    """Load strict JSON first, then the JSONC form used by some AGY setups."""
+    raw = raw.lstrip("\ufeff")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            normalized = _strip_jsonc_trailing_commas(_strip_jsonc_comments(raw))
+            return json.loads(normalized)
+        except (json.JSONDecodeError, ValueError) as jsonc_error:
+            raise MemoryMcpConfigError(
+                f"MCP config is not valid JSON or JSONC: {config_path}"
+            ) from jsonc_error
+
+
 def _load_config(config_path: Path) -> dict[str, Any]:
     try:
         raw = config_path.read_text(encoding="utf-8")
@@ -55,12 +164,7 @@ def _load_config(config_path: Path) -> dict[str, Any]:
             f"Cannot read MCP config {config_path}: {exc}"
         ) from exc
 
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise MemoryMcpConfigError(
-            f"MCP config is not valid JSON: {config_path}"
-        ) from exc
+    payload = _load_json_or_jsonc(raw, config_path)
     if not isinstance(payload, dict):
         raise MemoryMcpConfigError(
             f"MCP config must contain a JSON object: {config_path}"

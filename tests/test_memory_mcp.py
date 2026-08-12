@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -234,6 +235,70 @@ def test_mcp_config_merges_the_bot_server_without_losing_other_servers(
         bot_root=bot_root,
         db_path="/tmp/bot.db",
     ).state == "unchanged"
+
+
+def test_mcp_config_accepts_jsonc_without_losing_other_servers(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "mcp_config.json"
+    config_path.write_text(
+        """{
+  // Kept server configured by the user.
+  "mcpServers": {
+    "other": {
+      "command": "node",
+      "args": ["x",],
+    },
+  },
+}
+""",
+        encoding="utf-8",
+    )
+
+    report = ensure_memory_mcp_config(
+        config_path=config_path,
+        python_executable=Path(sys.executable),
+        bot_root=ROOT / "antigravity-bot",
+        db_path="/tmp/bot.db",
+    )
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+
+    assert report.state == "installed"
+    assert payload["mcpServers"]["other"] == {"command": "node", "args": ["x"]}
+    assert MEMORY_MCP_SERVER_NAME in payload["mcpServers"]
+
+
+def test_invalid_mcp_config_is_not_overwritten(tmp_path: Path) -> None:
+    config_path = tmp_path / "mcp_config.json"
+    original = '{"mcpServers": {"other": '
+    config_path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(MemoryMcpConfigError, match="not valid JSON or JSONC"):
+        ensure_memory_mcp_config(
+            config_path=config_path,
+            python_executable=Path(sys.executable),
+            bot_root=ROOT / "antigravity-bot",
+            db_path="/tmp/bot.db",
+        )
+
+    assert config_path.read_text(encoding="utf-8") == original
+
+
+def test_memory_mcp_configuration_failure_does_not_stop_the_bot(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from bot import __main__ as bot_main
+    from bot.services import memory_mcp_config
+
+    def fail_configuration(**_: object) -> None:
+        raise MemoryMcpConfigError("invalid user config")
+
+    monkeypatch.setattr(memory_mcp_config, "ensure_memory_mcp_config", fail_configuration)
+
+    with caplog.at_level(logging.WARNING, logger=bot_main.logger.name):
+        assert bot_main._configure_native_memory_tools() is False
+
+    assert "bot will continue without them" in caplog.text
 
 
 def test_mcp_config_refuses_to_overwrite_a_user_owned_server(tmp_path: Path) -> None:
