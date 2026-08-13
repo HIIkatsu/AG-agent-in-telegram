@@ -107,6 +107,15 @@ class TaskService:
         await self._record_event(task_id, "status", "Task queued")
         return task_id
 
+    async def get_thread_task_number(self, task_id: int, thread_id: int) -> int:
+        """Return the 1-based visible task number inside one Telegram topic."""
+        cursor = await self._database.conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE thread_id = ? AND id <= ?",
+            (thread_id, task_id),
+        )
+        row = await cursor.fetchone()
+        return int(row[0]) if row else 1
+
     async def pop_next_task(self, thread_id: int) -> dict | None:
         """Claim one queued task with one atomic SQLite write statement.
 
@@ -438,6 +447,10 @@ class TaskService:
 
 
 task_service = TaskService(db)
+
+
+async def get_thread_task_number(task_id: int, thread_id: int) -> int:
+    return await task_service.get_thread_task_number(task_id, thread_id)
 
 
 async def enqueue_task(

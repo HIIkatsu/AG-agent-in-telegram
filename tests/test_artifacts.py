@@ -175,3 +175,22 @@ def test_delivery_failure_preserves_output_for_safe_recovery(tmp_path: Path, mon
     assert report.delivered == 0
     assert report.failed == 1
     assert document.exists()
+
+def test_codeium_and_unleash_json_artifacts_are_never_collected(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _configure_artifact_root(tmp_path, monkeypatch)
+    output = artifacts.prepare_task_artifact_directory(76)
+    (output / "result.txt").write_text("ok", encoding="utf-8")
+    (output / "unleash-repo-schema-v1-codeium-language-server.json").write_text("{}", encoding="utf-8")
+    (output / "unleash-feature.json").write_text("{}", encoding="utf-8")
+    (output / "nested").mkdir()
+    (output / "nested" / "my-codeium-cache.txt").write_text("cache", encoding="utf-8")
+
+    collection = asyncio.run(artifacts.collect_task_artifacts(76))
+
+    assert [item.relative_path for item in collection.files] == ["result.txt"]
+    assert any("unleash-repo-schema" in item for item in collection.skipped)
+    assert any("unleash-feature.json" in item for item in collection.skipped)
+    assert any("my-codeium-cache" in item for item in collection.skipped)

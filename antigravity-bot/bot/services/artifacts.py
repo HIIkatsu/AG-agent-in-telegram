@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 _IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"})
 _MAX_ARTIFACT_DEPTH = 4
 _MAX_ARTIFACT_PATH_LENGTH = 240
+_IGNORED_ARTIFACT_NAME_RE = re.compile(r"(?:codeium|^unleash-.*\.json$)", re.IGNORECASE)
 
 # Direct output has to be intentional. This keeps ordinary chat replies and
 # incidental project files from being uploaded to Telegram merely because a
@@ -63,6 +64,11 @@ _EXPLICIT_IMAGE_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+
+def _is_ignored_system_artifact(relative_path: str) -> bool:
+    """Return True for known tool/cache files that must never reach Telegram."""
+    return any(_IGNORED_ARTIFACT_NAME_RE.search(part) for part in Path(relative_path).parts)
 
 
 class ArtifactError(RuntimeError):
@@ -282,6 +288,9 @@ def _collect_task_artifacts_sync(task_id: int) -> ArtifactCollection:
                 continue
             if len(relative) > _MAX_ARTIFACT_PATH_LENGTH:
                 skipped.append(f"слишком длинный путь: {entry.name}")
+                continue
+            if _is_ignored_system_artifact(relative):
+                skipped.append(f"пропущен системный артефакт: {relative}")
                 continue
             if metadata.st_size > max_size:
                 skipped.append(f"превышен размер файла: {relative}")

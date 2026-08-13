@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from aiogram import Bot, F, Router
 from aiogram.types import Message
 
-from bot.db import db
+from bot.db import db, telegram_topic_key
 from bot.services.agy_runner import run_agy
 from bot.services.artifacts import (
     ArtifactError,
@@ -307,9 +307,10 @@ def _buffer_media_group(
 @router.message(F.forum_topic_created)
 async def topic_created_handler(message: Message) -> None:
     """Handle new topic creation to save its name."""
-    thread_id = message.message_thread_id
-    if not thread_id:
+    telegram_thread_id = message.message_thread_id
+    if not telegram_thread_id:
         return
+    thread_id = telegram_topic_key(message.chat.id, telegram_thread_id)
     topic_name = message.forum_topic_created.name if message.forum_topic_created else "Новая ветка"
     # Just update the DB if it exists, or create if not
     await db.get_or_create_session(thread_id)
@@ -320,9 +321,10 @@ async def topic_created_handler(message: Message) -> None:
 @router.message(F.forum_topic_edited)
 async def topic_edited_handler(message: Message) -> None:
     """Handle topic rename."""
-    thread_id = message.message_thread_id
-    if not thread_id or not message.forum_topic_edited:
+    telegram_thread_id = message.message_thread_id
+    if not telegram_thread_id or not message.forum_topic_edited:
         return
+    thread_id = telegram_topic_key(message.chat.id, telegram_thread_id)
     new_name = message.forum_topic_edited.name
     if new_name:
         await db.conn.execute("UPDATE thread_sessions SET topic_name = ? WHERE thread_id = ?", (new_name, thread_id))
@@ -367,13 +369,14 @@ async def _process(
     files: list[str] | None = None,
 ) -> None:
     assert message.from_user
-    thread_id = message.message_thread_id
+    telegram_thread_id = message.message_thread_id
 
     # General topic → ignore regular prompts
-    if thread_id is None:
+    if telegram_thread_id is None:
         return
 
     chat_id = message.chat.id  # group chat ID for Telegram API
+    thread_id = telegram_topic_key(chat_id, telegram_thread_id)
     
     # Register messages for deep rollback tracking
     from bot.services.tracker import thread_messages_registry
@@ -446,7 +449,7 @@ async def _process(
         )
         if msg is not None:
             t_reg.append(msg.message_id)
-    elif not _start_queue_processing(thread_id, bot, chat_id):
+    elif not _start_queue_processing(thread_id, bot, chat_id, telegram_thread_id):
         pos = await get_queued_count(thread_id)
         msg = await _safe_message_reply(
             message,
@@ -477,23 +480,23 @@ def _tracker_finish_status(status: object) -> str:
     }.get(resolved, "ERROR")
 
 
-def _start_queue_processing(thread_id: int, bot: Bot, chat_id: int) -> bool:
+def _start_queue_processing(thread_id: int, bot: Bot, chat_id: int, telegram_thread_id: int) -> bool:
     """Start one queue runner per thread and report whether it was started."""
     if thread_id in _queue_loops:
         return False
     _queue_loops.add(thread_id)
-    asyncio.create_task(_process_queue(thread_id, bot, chat_id))
+    asyncio.create_task(_process_queue(thread_id, bot, chat_id, telegram_thread_id))
     return True
 
 
-async def resume_queue_processing(thread_id: int, bot: Bot, chat_id: int) -> None:
+async def resume_queue_processing(thread_id: int, bot: Bot, chat_id: int, telegram_thread_id: int | None = None) -> None:
     """Resume queued work after a task workspace has been finalized."""
     while thread_id in _queue_loops:
         await asyncio.sleep(0.05)
-    _start_queue_processing(thread_id, bot, chat_id)
+    _start_queue_processing(thread_id, bot, chat_id, telegram_thread_id or thread_id)
 
-async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
-    from bot.services.task_service import TaskStatus, finish_task, pop_next_task
+async def _process_queue(thread_id: int, bot: Bot, chat_id: int, telegram_thread_id: int) -> None:
+    from bot.services.task_service import TaskStatus, finish_task, get_thread_task_number, pop_next_task
     from bot.services.task_service import log_task_event
     from bot.services.task_workspace import task_workspace_manager
     from bot.services.tracker import thread_messages_registry
@@ -528,19 +531,16 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
             mode_config = get_mode_config(mode)
             web_search = effective_web_policy(session.get("web_search"), mode_config["web"])
 
-            # Use the durable per-topic session UUID as the namespace for AGY
-            # projects.  Telegram thread IDs are only scoped to a chat, and
-            # reusing a long-lived AGY project with --continue makes old tool
-            # failures part of every later prompt.  A fresh task project keeps
-            # each Telegram topic isolated while the bot still injects the
-            # bounded, topic-scoped memory selected above.
+            # One Telegram topic is one durable AGY conversation.  The ID is
+            # derived only from the composite chat_id + Telegram topic ID; it
+            # is intentionally not tied to task_id, so follow-up prompts in the
+            # same topic keep AGY memory while another topic starts clean.
             import uuid as _uuid
             _NAMESPACE_AGY_PROJECT = _uuid.UUID('6ba7b810-9ed0-11d1-80b4-00c04fd430c8')
-            session_uuid = str(session.get("uuid") or f"thread-{thread_id}")
             conversation_id = str(
                 _uuid.uuid5(
                     _NAMESPACE_AGY_PROJECT,
-                    f"session-{session_uuid}-task-{task_id}",
+                    f"telegram-topic:{chat_id}:{telegram_thread_id}",
                 )
             )
 
@@ -550,7 +550,7 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 f"<b>{'⚡ Chat' if execution_profile == 'chat' else '🛠 Code task'}</b>\n└─ [⠋] Обработка...",
                 label=f"task #{task_id} status card",
                 parse_mode="HTML",
-                message_thread_id=thread_id,
+                message_thread_id=telegram_thread_id,
             )
             if status_msg is None:
                 # The durable queue and the worker do not depend on an
@@ -563,7 +563,7 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
 
             stop_typing = asyncio.Event()
             typing_task = asyncio.create_task(
-                _typing_loop(bot, chat_id, stop_typing, thread_id)
+                _typing_loop(bot, chat_id, stop_typing, telegram_thread_id)
             )
             
             t_reg = thread_messages_registry.setdefault(thread_id, [])
@@ -571,17 +571,19 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 t_reg.append(status_msg.message_id)
             
             tracker = TaskTracker(
-                bot, thread_id, status_msg, ws_dir=ws, 
-                commit_hash=None, task_id=task_id, 
+                bot, thread_id, status_msg, ws_dir=ws,
+                commit_hash=None, task_id=task_id,
                 model=model, mode="⚡ Chat" if execution_profile == "chat" else "🛠 Code task"
             )
+            tracker.display_task_id = await get_thread_task_number(task_id, thread_id)
             await tracker.start()
             # Make Stop effective even while the isolated snapshot is being
             # prepared (before the AGY subprocess exists).
             _active_tasks[thread_id] = (tracker, None)
 
             agent_ws = ws
-            if execution_profile == "code":
+            use_review_workspace = execution_profile == "code" and bool(session.get("is_mounted"))
+            if use_review_workspace:
                 await tracker.on_tool_start("task_workspace", "Создаю изолированный workspace")
                 try:
                     workspace = await task_workspace_manager.prepare(
@@ -646,7 +648,7 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                     TaskStatus.FAILED,
                     error=str(exc),
                 )
-                if execution_profile == "code":
+                if use_review_workspace:
                     try:
                         await task_workspace_manager.discard(
                             task_id,
@@ -770,7 +772,7 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                     bot,
                     chat_id,
                     task_artifacts,
-                    thread_id=thread_id,
+                    thread_id=telegram_thread_id,
                     rollback_list=rlist,
                 )
                 if report.failed or task_artifacts.skipped:
@@ -804,7 +806,7 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 )
             ).status
 
-            if execution_profile == "code":
+            if use_review_workspace:
                 try:
                     tracker.has_changes_after_finish = await task_workspace_manager.has_changes(task_id)
                     if tracker.has_changes_after_finish:
@@ -833,14 +835,15 @@ async def _process_queue(thread_id: int, bot: Bot, chat_id: int) -> None:
                 await asyncio.sleep(0.5)
                 continue
 
-            try:
-                await task_workspace_manager.discard(
-                    task_id,
-                    state="unchanged",
-                    allow_active=True,
-                )
-            except Exception:
-                logger.exception("Failed to clean unchanged task workspace #%s", task_id)
+            if use_review_workspace:
+                try:
+                    await task_workspace_manager.discard(
+                        task_id,
+                        state="unchanged",
+                        allow_active=True,
+                    )
+                except Exception:
+                    logger.exception("Failed to clean unchanged task workspace #%s", task_id)
             await asyncio.sleep(0.5)
             
     finally:
@@ -858,10 +861,11 @@ async def on_text(message: Message, bot: Bot) -> None:
 @router.message(F.photo)
 async def on_photo(message: Message, bot: Bot) -> None:
     assert message.from_user
-    thread_id = message.message_thread_id
-    if thread_id is None:
+    telegram_thread_id = message.message_thread_id
+    if telegram_thread_id is None:
         return
 
+    thread_id = telegram_topic_key(message.chat.id, telegram_thread_id)
     session = await db.get_or_create_session(thread_id)
     ws = session["workdir"]
     uploads_dir = os.path.join(ws, "uploads")
@@ -887,10 +891,11 @@ async def on_photo(message: Message, bot: Bot) -> None:
 @router.message(F.document)
 async def on_document(message: Message, bot: Bot) -> None:
     assert message.from_user and message.document
-    thread_id = message.message_thread_id
-    if thread_id is None:
+    telegram_thread_id = message.message_thread_id
+    if telegram_thread_id is None:
         return
 
+    thread_id = telegram_topic_key(message.chat.id, telegram_thread_id)
     session = await db.get_or_create_session(thread_id)
     ws = session["workdir"]
     uploads_dir = os.path.join(ws, "uploads")
