@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import uuid
+import hashlib
 from datetime import datetime, timezone
 
 import aiosqlite
@@ -166,6 +167,23 @@ CREATE TABLE IF NOT EXISTS command_runs (
     output TEXT
 );
 """
+
+
+def telegram_topic_key(chat_id: int, message_thread_id: int | None) -> int:
+    """Return the durable DB key for one Telegram chat/topic pair.
+
+    Telegram forum topic IDs are only unique inside a chat.  All per-topic
+    state (session, queue, memory, context, workspace) must therefore use the
+    composite chat_id + message_thread_id identity instead of the raw topic ID.
+    """
+    if message_thread_id is None:
+        return 0
+    digest = hashlib.blake2b(
+        f"telegram-topic:{chat_id}:{message_thread_id}".encode("utf-8"),
+        digest_size=8,
+    ).digest()
+    # Keep the value positive and below SQLite's signed 64-bit integer limit.
+    return int.from_bytes(digest, "big") & ((1 << 63) - 1)
 
 
 def _now() -> str:

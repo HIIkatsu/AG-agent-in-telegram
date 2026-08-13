@@ -9,7 +9,7 @@ from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.config import settings
-from bot.db import db
+from bot.db import db, telegram_topic_key
 from bot.services.diff_viewer import generate_diff_html_file
 from bot.services.git_manager import git_manager
 from bot.services.permissions import permission_handler
@@ -21,6 +21,12 @@ from bot.services.task_workspace import (
 
 router = Router(name="callbacks")
 logger = logging.getLogger(__name__)
+
+
+def _callback_topic_key(cq: CallbackQuery) -> int | None:
+    if cq.message is None or cq.message.message_thread_id is None:
+        return None
+    return telegram_topic_key(cq.message.chat.id, cq.message.message_thread_id)
 
 
 def _short_error(exc: BaseException, limit: int = 120) -> str:
@@ -147,7 +153,7 @@ async def cb_view_diff(cq: CallbackQuery, bot: Bot) -> None:
             if not workspace:
                 await cq.answer("Изолированный workspace задачи не найден", show_alert=True)
                 return
-            if cq.message.message_thread_id != workspace.thread_id:
+            if _callback_topic_key(cq) != workspace.thread_id:
                 await cq.answer("Задача не принадлежит этому проекту.", show_alert=True)
                 return
             thread_id = workspace.thread_id
@@ -188,7 +194,7 @@ async def cb_view_diff(cq: CallbackQuery, bot: Bot) -> None:
         doc,
         caption="👀 <b>Diff изменений (VS Code Side-by-Side View):</b>\nОткройте файл в браузере для удобного просмотра.",
         parse_mode="HTML",
-        message_thread_id=thread_id,
+        message_thread_id=cq.message.message_thread_id,
     )
 
 
@@ -206,7 +212,7 @@ async def cb_accept_diff(cq: CallbackQuery, bot: Bot) -> None:
     if not workspace:
         await cq.answer("Изолированный workspace задачи не найден", show_alert=True)
         return
-    if cq.message.message_thread_id != workspace.thread_id:
+    if _callback_topic_key(cq) != workspace.thread_id:
         await cq.answer("Задача не принадлежит этому проекту.", show_alert=True)
         return
     try:
@@ -256,7 +262,7 @@ async def cb_rollback(cq: CallbackQuery, bot: Bot) -> None:
     if not workspace:
         await cq.answer("Изолированный workspace задачи не найден", show_alert=True)
         return
-    if cq.message.message_thread_id != workspace.thread_id:
+    if _callback_topic_key(cq) != workspace.thread_id:
         await cq.answer("Задача не принадлежит этому проекту.", show_alert=True)
         return
     try:
@@ -305,7 +311,7 @@ async def cb_cancel_task(cq: CallbackQuery) -> None:
         stop_task_and_queue,
     )
 
-    thread_id = cq.message.message_thread_id  # type: ignore[union-attr]
+    thread_id = _callback_topic_key(cq)
     if thread_id is None:
         await cq.answer("Нечего отменять")
         return
@@ -361,7 +367,7 @@ async def cb_task_status(cq: CallbackQuery) -> None:
     except ValueError:
         await cq.answer("Некорректный ID задачи", show_alert=True)
         return
-    thread_id = cq.message.message_thread_id
+    thread_id = _callback_topic_key(cq)
     if thread_id is None or not await get_task(task_id, thread_id=thread_id):
         await cq.answer("Задача не принадлежит этому проекту.", show_alert=True)
         return
@@ -383,7 +389,7 @@ async def cb_retry_task(cq: CallbackQuery, bot: Bot) -> None:
     except ValueError:
         await cq.answer("Некорректный ID задачи", show_alert=True)
         return
-    thread_id = cq.message.message_thread_id
+    thread_id = _callback_topic_key(cq)
     task = (
         await get_task(task_id, thread_id=thread_id)
         if thread_id is not None
@@ -408,7 +414,7 @@ async def cb_retry_task(cq: CallbackQuery, bot: Bot) -> None:
         retry_of_task_id=task_id,
     )
     from bot.handlers.message import _start_queue_processing
-    _start_queue_processing(task["thread_id"], bot, task["chat_id"])
+    _start_queue_processing(task["thread_id"], bot, task["chat_id"], cq.message.message_thread_id)
     await cq.answer(f"Задача #{new_id} добавлена в очередь")
 
 
@@ -423,7 +429,7 @@ async def cb_view_logs(cq: CallbackQuery) -> None:
     except ValueError:
         await cq.answer("Некорректный ID задачи", show_alert=True)
         return
-    thread_id = cq.message.message_thread_id
+    thread_id = _callback_topic_key(cq)
     if thread_id is None or not await get_task(task_id, thread_id=thread_id):
         await cq.answer("Задача не принадлежит этому проекту.", show_alert=True)
         return
@@ -448,7 +454,7 @@ async def cb_clear_queue(cq: CallbackQuery) -> None:
     except (IndexError, ValueError):
         await cq.answer("Некорректный проект.", show_alert=True)
         return
-    if cq.message is None or cq.message.message_thread_id != thread_id:
+    if cq.message is None or _callback_topic_key(cq) != thread_id:
         await cq.answer("Очередь другого проекта менять нельзя.", show_alert=True)
         return
     await cancel_queue(thread_id)

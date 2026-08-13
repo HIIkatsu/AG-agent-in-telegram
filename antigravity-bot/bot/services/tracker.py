@@ -76,6 +76,7 @@ class TaskTracker:
         self.debounce = max(debounce, 0.8)
         self.commit_hash = commit_hash
         self.task_id = task_id
+        self.display_task_id = task_id
         self.model = model
         self.mode = mode
         self.started_at = started_at or datetime.now()
@@ -195,7 +196,7 @@ class TaskTracker:
         elapsed = f"{m:02d}:{s:02d}"
         
         project_name = os.path.basename(self.ws_dir)
-        header = f"🧠 Задача #{self.task_id or '?'}\n"
+        header = f"🧠 Задача #{self.display_task_id or self.task_id or '?'}\n"
         header += f"Проект: <b>{project_name}</b>\n"
         header += f"⏱ Время: {elapsed} | Модель: <i>{self.model or 'default'}</i> | Режим: <i>{self.mode}</i>\n\n"
         
